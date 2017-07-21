@@ -1,0 +1,1857 @@
+---
+title: "HBoV-1 Persistence Modeling"
+date: "`r format(Sys.time(),'%B, %d, %Y')`"
+output: 
+  html_document: 
+    code_folding: hide
+    highlight: tango
+    theme: united
+    toc: yes
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      eval = TRUE,
+                      message = FALSE,
+                      warning = FALSE,
+                      fig.width = 12,
+                      fig.height = 8)
+```
+
+<font size = "5"> Unfold code to see data processing steps </font>
+
+# R Packages Used
+
+```{r library loading}
+library(xlsx)         # load .xlsx and .xls
+library(lubridate)    # time and date functions
+library(gridExtra)    # grid.arrange
+library(xts)          # time-series objects and functions
+library(knitr)        
+library(Rmisc)        
+library(DT)           # Javascript DataTables 
+library(sandwich)     # robust estimating equations for standard errors
+library(visreg)       # visualize regressions
+library(ggthemes)     # theme_tufte, theme_bw, etc.
+library(gridExtra)    # arrange ggplot grobs
+library(RColorBrewer) # plotting colors
+library(forecast)     # moving averages, lags, forecasting
+library(lattice)      # versatile plotting functions
+library(magrittr)     # extra pipelines/infix operators (%<>%)
+library(reshape2)     # melt and cast data, i.e. wide to long, long to wide
+library(tidyverse)    # everything, including ggplot, dplyr, etc.
+library(caret)        # model building and testing
+library(msm)          # msm package carries 'deltamethod()'
+```
+
+# Data Loading
+
+```{r, echo = TRUE, eval = FALSE}
+setwd("S:/MartinEpi/Analysis/Bocavirus Persistence Modeling/")
+test.results <- "bovtestresults_rich.xls"
+test.results <- read.xlsx(test.results, 
+                          stringsAsFactors = FALSE, sheetIndex = 1)
+
+test.results.pos <- "test_results_pos.xlsx"
+test.results.pos <- read.xlsx(test.results.pos,
+                              stringsAsFactors = FALSE, sheetIndex = 1)
+
+diaries <- "diaries.csv"
+diaries <- read.csv(diaries, stringsAsFactors = FALSE)
+
+diary.pos <- "diary_pos.csv"
+diary.pos <- read.csv(diary.pos, stringsAsFactors = FALSE)
+
+main.long <- "main_long.csv"
+main.long <- read.csv(main.long, stringsAsFactors = FALSE)
+
+main <- "main.csv"
+main <- read.csv(main, stringsAsFactors = FALSE)
+
+results.dob <- "results_dob.csv"
+results.dob <- read.csv(results.dob, stringsAsFactors = FALSE)
+
+season.decomp <- "season_decomp.csv"
+season.decomp <- read.csv(season.decomp, stringsAsFactors = FALSE)
+
+durations <- "S:/MartinEpi/Analysis/Bocavirus Duration of Positivity/Excel Files/positive duration intervals.xlsx" 
+durations <- read.xlsx(durations, stringsAsFactors = FALSE, sheetIndex = 1)
+```
+
+Will a young child with a persistent bocavirus infection be protected from further illness? Can we find indicators of this in our dataset? 
+
+In order to gather evidence for our hypothesis we will perform three analyses, each with three sub-analyses:
+  
+1. Poisson Regression
+    - count number of fevers over time given a child's number of weeks of persistent infection. The offset will be the total number of weeks in the study.
+2. Longitudinal Analysis via linear Mixed Modeling
+3. Time Series Modeling to Account for Density of Time-Dependent Observations: GAM?
+
+Alternatively, we want to examine re-infections using a 2-stage hidden markov model.
+
+# Data Processing and Cleaning
+
+```{r, echo = TRUE, eval = FALSE}
+colnames(diaries) <- tolower(colnames(diaries))
+colnames(diary.pos) <- tolower(colnames(diary.pos))
+colnames(durations) <- tolower(colnames(durations))
+colnames(main) <- tolower(colnames(main))
+colnames(main.long) <- tolower(colnames(main.long))
+colnames(results.dob) <- tolower(colnames(results.dob))
+colnames(season.decomp) <- tolower(colnames(season.decomp))
+colnames(test.results) <- tolower(colnames(test.results))
+colnames(test.results.pos) <- tolower(colnames(test.results.pos))
+colnames(durations) <- tolower(colnames(durations))
+```
+
+```{r, echo = TRUE, eval = FALSE}
+test.results %<>%
+  mutate(id = factor(patient),
+         log_q_per_ml = log10(q_per_ml),
+         date_ct = ave(as.numeric(id), id, FUN = seq_along))
+
+test.results.pos %<>%
+  mutate(id = factor(patient),
+         q_per_ml = as.numeric(q_per_ml),
+         log_q_per_ml = log10(q_per_ml),
+         date_ct = ave(as.numeric(id), id, FUN = seq_along))
+
+test.results.red <- test.results.pos %>% select(id, bovpos, date)
+
+diaries %<>%
+  mutate(id = factor(id),
+         infant.dob = as.Date(infant.dob, format = "%d-%b-%y"),
+         date = as.Date(date, format = "%d-%b-%y"))
+
+diary.pos %<>%
+  mutate(id = factor(id),
+         date = as.Date(date, format = "%d-%b-%y"),
+         infant.dob = as.Date(infant.dob, format = "%d-%b-%y"))
+
+pcr.by.week <- diary.pos %>% 
+  select(id, date, pcr) %>%
+  mutate(week = format(date, format = "%Y-%U")) %>%
+  plyr::ddply(plyr::.(week, id), summarise, 
+              pcr.sum = sum(pcr, na.rm = TRUE))
+
+# Gather only bocavirus positive children
+id <- data.frame(id = factor(unique(test.results.pos$id)))
+
+# Clean up main datasets
+to_date <- c("date","infant.dob","stopdate","until.when","maternal.dob",
+             "daycare.start", "daycare.end","play.start","play.end")
+main %<>%
+  mutate_at(to_date, funs(as.Date(., format = "%d-%b-%y"))) %>%
+  mutate(id = factor(id),
+         gender = factor(gender),
+         maternal.dob = as.Date(ifelse(maternal.dob > "2000-01-01",
+                                       format(maternal.dob, "19%y-%m-%d"),
+                                       format(maternal.dob))),
+         race_text = factor(race_text),
+         play.group = factor(play.group),
+         daycare.dur = as.numeric(difftime(daycare.end, daycare.start,
+                                           units = "weeks"))) %>%
+  rename(number.of.family.18.yrs = number.of.family..18.yrs)
+
+dem.clin.dat <- main %>% 
+  select(id, gender, race, race_text, total.number.of.family, 
+                number.of.family.18.yrs, bf_duration, mom_age,
+                siblings, breast_fed, day_care, seizure_hx, female, bf_length,
+                daycare.start, daycare.end)
+
+main.pos <- merge(id, main, by = "id")
+
+to_date <- c("date","maternal.dob","infant.dob","stopdate",
+             "until.when","daycare.start","daycare.end",
+             "play.start","play.end")
+
+main.long %<>%
+  mutate_at(to_date, funs(as.Date(., format = "%d%B%Y"))) %>%
+  mutate(id = factor(id),
+         gender = factor(gender),
+         race_text = factor(race_text),
+         play.group = factor(play.group)) %>%
+  rename(days.week.play = days.week..play.)
+
+main.long <- merge(id, main.long, by = "id")
+
+durations$id <- factor(durations$patient)
+
+season.decomp$datetime <- as.Date(season.decomp$datetime, format = "%m/%d/%y")
+```
+
+```{r, eval = FALSE, echo = TRUE}
+# Save .Rdata files. Done 'outside of markdown'
+setwd("S:/MartinEpi/Analysis/Bocavirus Persistence Modeling/Rdata/")
+saveRDS(dem.clin.dat, "dem_clin_dat.rds")
+saveRDS(diaries, "diaries.rds")
+saveRDS(diary.pos, "diary_pos.rds")
+saveRDS(id, "pos_id.rds")
+saveRDS(main, "main.rds")
+saveRDS(main.long, "main_long.rds")
+saveRDS(main.pos, "main_pos.rds")
+saveRDS(pcr.by.week, "pcr_by_week.rds")
+saveRDS(results.dob, "results_dob.rds")
+saveRDS(season.decomp, "season_decomp.rds")
+saveRDS(test.results.pos, "test_results_pos.rds")
+saveRDS(durations, "durations.rds")
+```
+
+Load .Rdata files for speed and efficiency
+
+```{r}
+setwd("S:/MartinEpi/Analysis/Bocavirus Persistence Modeling/Rdata/")
+dem.clin.dat <- readRDS("dem_clin_dat.rds")
+diaries <- readRDS("diaries.rds")
+diary.pos <- readRDS("diary_pos.rds")
+id <- readRDS("pos_id.rds")
+main <- readRDS("main.rds")
+main.long <- readRDS("main_long.rds")
+main.pos <- readRDS("main_pos.rds")
+pcr.by.week <- readRDS("pcr_by_week.rds")
+results.dob <- readRDS("results_dob.rds")
+season.decomp <- readRDS("season_decomp.rds")
+test.results.pos <- readRDS("test_results_pos.rds")
+durations <- readRDS("durations.rds")
+```
+
+# Exploration
+
+## Definitions of Persistent Infection
+
+Three different definitions for duration of positivity
+
+1. Primary infection criteria: no more than one interim negative specimen, at least two consecutive negatives for entry and exit
+2. Same as definition 1, except now using the first date of infection as day 1 for BOV positive patients (often inflated)
+3. Using the longest continuous infectious period for each patient, regardless of primary or later infection. No more than one interim negative specimen.
+
+plotting patient 20 and 221 for illustration purposes
+
+```{r}
+pt20 <- test.results.pos[which(test.results.pos$id == 20), ]
+pt20 <- pt20[complete.cases(pt20[,9]),]
+pt20.def.1 <- filter(pt20, 
+                     date >= as.Date('1999-03-22') & 
+                       date <= as.Date('1999-04-06'))
+pt20.def.2 <- filter(pt20, 
+                     date >= as.Date('1999-01-09') &
+                       date <= as.Date('1999-04-06'))
+
+pt221 <- test.results.pos[which(test.results.pos$id == 221), ]
+pt221 <- pt221[complete.cases(pt221[,9]), ]
+# split data set by infection period, by definition
+pt221.def.1 <- filter(pt221, date == as.Date('2000-12-02') | 
+                        date == as.Date('2000-12-09') | 
+                        date == as.Date('2000-12-16'))
+pt221.def.3 <- filter(pt221, 
+                      date >= as.Date('2001-04-07') & 
+                        date <= as.Date('2002-02-09'))
+
+p <- pt221.def.1 %>%
+  ggplot(aes(x = date, y = log_q_per_ml)) %>%
+  add(geom_point(aes(color = "red"), size = 3.0)) %>%
+  add(geom_line(aes(color = "red"), size = 1.0)) %>%
+  add(geom_point(data = pt221.def.3, 
+                 aes(x = date, y = log_q_per_ml, color = "blue"), 
+                 size = 3.0)) %>%
+  add(geom_line(data = pt221.def.3, 
+                aes(x = date, y = log_q_per_ml, group = 1, color = "blue"),
+                size = 1.0)) %>%
+  add(labs(x = "Date",
+           y = "Log(q/mL)",
+           title = "Patient 221: Duration of Positivity, Definitions 1 and 3")) %>%
+  add(scale_color_manual(name = "Defintion",
+                         values = c("red" = "red", "blue" = "blue"),
+                         labels = c("Defintion 3", "Definition 1"))) %>%
+  add(theme(legend.text = element_text(size = 13),
+              legend.title = element_text(size = 13),
+              axis.title.x = element_blank(),
+              axis.text = element_text(size = 13, color = "black"),
+              plot.title = element_text(size = 13, face = "bold"),
+              panel.background = element_rect(fill = "white"),
+              panel.grid.major = element_line(color = "lightgrey")))
+
+p2 <- pt221 %>%
+  ggplot(aes(x = date, y = log_q_per_ml), legend = TRUE) %>%
+  add(geom_point(aes(color = "Log(q/mL)"), size = 4.0)) %>%
+  add(labs(y = "Log(q/mL)",
+           title = "Patient 221")) %>%
+  add(theme(axis.title.x = element_blank(),
+                axis.title.y = element_text(size = 13),
+                legend.text = element_text(size = 13),
+                legend.title = element_blank(),
+                axis.text = element_text(size = 13, color = "black"),
+                plot.title = element_text(size = 13, face = "bold"),
+                panel.background = element_rect(fill = "white"),
+                panel.grid.major = element_line(color = "lightgrey")))
+
+q <- pt20 %>%
+  ggplot(aes(x = date, y = log_q_per_ml)) %>%
+  add(geom_point(data = pt20.def.1, 
+                 aes(x = date, y = log_q_per_ml, col = "red"), 
+                 size = 5.0)) %>%
+  add(geom_line(data = pt20.def.1, 
+                aes(x = date, y = log_q_per_ml, col = "red"),
+                size = 3.0, linetype = 1)) %>%
+  add(geom_point(data = pt20.def.2, 
+                 aes(x = date, y = log_q_per_ml, col = "seagreen4"), 
+                 size = 3.0)) %>%
+  add(geom_line(data = pt20.def.2,
+                aes(x = date, y = log_q_per_ml, col = "seagreen4", group = 1), 
+                size = 1.0)) %>%
+  add(labs(y = "Log(q/mL",
+           x = "Date",
+           title = "Patient 20: Duration of Positivity, Definitions 1 and 2")) %>%
+  add(scale_color_manual(name = "Definition",
+                         values = c("red" = "red", "seagreen4" = "seagreen4"),
+                         labels = c("Definition1", "Definition 2"))) %>%
+  add(theme(axis.title.y = element_text(size = 13),
+              plot.title = element_text(size = 13, face = "bold"),
+              axis.text = element_text(size = 13, color = "black"),
+              legend.text = element_text(size = 13),
+              legend.title = element_text(size = 13),
+              axis.title.x = element_blank(),
+              panel.background = element_rect(fill = "white"),
+              panel.grid.major = element_line(color = "lightgrey")))
+
+q2 <- pt20 %>%
+  ggplot(aes(x = date, y = log_q_per_ml)) %>%
+  add(geom_point(size = 4.0, aes(color = "Log(q/mL)"))) %>%
+  add(labs(y = "Log(q/mL)",
+           x = "Date",
+           title = "Patient 20")) %>%
+  add(theme(legend.text = element_text(size = 13),
+                legend.title = element_blank(),
+                axis.title.y = element_text(size = 13),
+                axis.text = element_text(size = 13, color = "black"),
+                plot.title = element_text(size = 13, face = "bold"),
+                axis.title.x = element_text(size = 13),
+                panel.background = element_rect(fill = "white"),
+                panel.grid.major = element_line(color = "lightgrey")))
+
+grid.arrange(p, p2, q, q2, nrow = 4)
+```
+
+# Modelling
+
+## Poisson Regression
+
+The form of the generalized linear model: 
+$$g(\mu_i)=\beta_0+\beta_1x_{1,i}+...+\beta_kx_{k,i}$$
+with *Random Component*:
+$$Y \sim Poisson(t_i\mu_i)$$
+where t is the offset of time, more specifically, the expectation of *Y/t*, is $\mu$,
+$$E[Y/t]=\mu$$
+And the *Systematic Component*:
+Any set of $X_i=(x_{1,i},x_{2,i},...,x_{k,i})$ covariates
+And the *Link* function:
+$$log(Y/t)$$
+The regression model for the expected rate of the occurrence of fevers in our set-up is:
+$$log(t_i\mu_i) = \beta_0 + \beta_{1}*(Weeks of Infection_i)$$
+                              - Or - 
+$$log(\mu_i) = \beta_0 + \beta_{1,i}*(Weeks of Infection_i) + log(t_i)$$
+
+First need to count total number of weeks each patient was in the study, for the offset
+
+```{r}
+max.weeks <- aggregate(age_week ~ id, main.long, max)
+max.weeks <- merge(max.weeks, id, by = "id")
+glimpse(max.weeks)
+
+max.days <- aggregate(age_week * 7 ~ id, main.long, max)
+colnames(max.days) <- c("id","study_time")
+max.days <- merge(max.days, id, by = "id")
+glimpse(max.days)
+```
+
+Now we need to count total number of fevers by ID
+
+```{r}
+fever.count <- aggregate(fever ~ id, diary.pos, sum, na.rm = TRUE)
+glimpse(fever.count)
+```
+
+To get a final data set for poisson regression, we will merge everything together
+
+```{r}
+all.df <- Reduce(function(x,y){merge(x, y, all = TRUE)},
+                 list(max.days, 
+                      fever.count, 
+                      main.pos,
+                      durations[,grep("interval|id", names(durations))]))
+# main <- merge(merge(max.weeks, fever.count, by="id", all=TRUE), main.pos, by="id", all=TRUE)
+```
+
+The three main components are,
+1. the number of fevers incurred by the children over time
+2. number of days in the study (offset)
+3. number of days of persistent infection
+
+```{r, descriptives}
+df.reduced <- all.df %>%
+  select(study_time, fever, day_care,
+         interval_def1, interval_def2, interval_def3)
+  
+df.reduced %>%
+  mutate(id = as.numeric(rownames(df.reduced))) %>%
+  melt(id = "id") %>%
+  ggplot(aes(x = value)) %>%
+  add(geom_histogram(aes(x = value))) %>%
+  add(facet_wrap(~variable, scales = "free")) %>%
+  add(theme_bw())
+```
+
+Most children in the study were followed for two years with a median follow-up time of `r median(df.reduced$Study_time)` which is roughly $52*2*7 = 728$, the number of days in two years. The median number of fevers over time is `r median(df.reduced$fever)` while the median duration of "persistent infection" for each definition was `r median(df.reduced$interval_def1)`, `r median(df.reduced$interval_def2)`, and `r median(df.reduced$interval_def3)`, respectively
+
+Comparing HBoV-1 infections in newborns from Kampala, Uganda and Seattle, Washington US.
+```{r}
+durations %>% 
+  select(first_date_def1, end_date_def1_and_2) %>% 
+  mutate(interval = as.numeric(difftime(end_date_def1_and_2, 
+                                        first_date_def1, 
+                                        units = "weeks"))) %>%
+  filter(interval >= 2.0) %>%
+  ggplot() %>% 
+  add(geom_histogram(aes(x = interval), binwidth = 1)) %>%
+  add(geom_vline(aes(xintercept = median(interval, na.rm = TRUE)),
+                 color = "red", linetype = "dashed", size = 1)) %>%
+  add(scale_x_continuous(breaks = seq(from = 0, to = 60, by = 5))) %>%
+  add(theme_bw()) %>%
+  add(labs(x = "",
+           y = "Frequency",
+           title = "Persistent Bocavirus Infections in Newborns",
+           subtitle = "Prospective Cohort (n = 55) from Seattle, Washington, USA"))
+```
+
+```{r}
+f <- function(x){
+  mean = mean(x, na.rm = TRUE)
+  sd = sd(x, na.rm = TRUE)
+  median = median(x, na.rm = TRUE)
+  minimum = min(x, na.rm = TRUE)
+  maximum = max(x, na.rm = TRUE)
+  n = length(x)
+  rbind(mean, sd, median, minimum, maximum, n)
+}
+
+data.frame(lapply(df.reduced, f))
+```
+
+Only consider those with a duration >= 14 days (two weeks)
+
+```{r}
+temp <- df.reduced %>%
+  select(interval_def1, interval_def2, interval_def3) %>%
+  mutate(interval_def1 = ifelse(interval_def1 < 14, NA, interval_def1),
+         interval_def2 = ifelse(interval_def2 < 14, NA, interval_def2),
+         interval_def3 = ifelse(interval_def3 < 14, NA, interval_def3))
+
+data.frame(lapply(temp, f))
+rm(temp)
+```
+
+Run Models
+
+```{r}
+model.def.1 <- glm(fever ~ interval_def1 + offset(log(study_time)),
+                   family = poisson, data = df.reduced)
+model.def.2 <- glm(fever ~ interval_def2 + offset(log(study_time)), 
+                   family = poisson, data = df.reduced)
+model.def.3 <- glm(fever ~ interval_def3 + offset(log(study_time)),
+                   family = poisson, data = df.reduced)
+
+par(mfrow = c(3, 4))
+plot(model.def.1, main = "Definition 1")
+plot(model.def.2, main = "Definition 2")
+plot(model.def.3, main = "Definition 3")
+par(mfrow = c(1, 1))
+```
+
+Cameron and Trivedi (2009) recommended using robust standard errors for the parameter estimates to control for mild violation of the distribution assumption that the variance equals the mean. The R package sandwich is used below to obtain the robust standard errors and the p-values. Together with the p-values, we have also calculated the 95% confidence interval using the parameter estimates and their robust standard errors
+
+```{r}
+robustErrors <- function(model.object) {
+  # Heteroskedasticity-consistent estimation of the covariance matrix 
+  cov.ml <- vcovHC(model.object, type = "HC0")
+  std.err <- sqrt(diag(cov.ml))
+  r.est.1 <- cbind(
+    Estimate = coef(model.object),
+    model.se = summary(model.object)$coefficients[, 2],
+    "Robust SE" = std.err,
+    "Pr(>|Z|)" = 2*pnorm(abs(coef(model.object)/std.err), lower.tail = FALSE),
+    LB = coef(model.object) - 1.96*std.err,
+    UB = coef(model.object) + 1.96*std.err
+    )
+  r.est.1
+}
+
+models <- list(model.def.1, model.def.2, model.def.3)
+
+lapply(models, robustErrors)
+```
+
+To obtain incident rate ratio versions of our estimates we will turn to the delta method:
+
+The delta method expands a differentiable function of a random variable about its mean, 
+usually with a first-order Taylor approximation, and then takes the variance
+
+```{r}
+rateRatios1 <- function(model.object) {
+  require(msm)
+  cov.ml <- vcovHC(model.object, type = "HC0")
+  r.est.1 <- robustErrors(model.object)
+  s <- deltamethod(list(~exp(x1), ~ exp(x2)), coef(model.object), cov.ml)
+  rexp.est.1 <- exp(r.est.1[, -4]) # removing (uncorrected) p-values
+  rexp.est.1[,"Robust SE"] <- s
+  rexp.est.1
+}
+
+lapply(models, rateRatios1)
+```
+
+Plotting
+
+Predictive curves
+```{r, plots}
+par(mfrow = c(1, 3))
+visreg(model.def.1, "interval_def1", scale = "response")
+visreg(model.def.2, "interval_def2", scale = "response")
+visreg(model.def.3, "interval_def3", scale = "response")
+par(mfrow = c(1, 1))
+```
+
+Those are all very similar looking
+
+```{r, echo = FALSE}
+myCols <- brewer.pal(5, "Set1")
+
+df.reduced %>%
+  select(fever, contains('interval')) %>%
+  melt(id = "fever") %>%
+  mutate(variable = factor(variable,
+         levels = c("interval_def1", "interval_def2", "interval_def3"),
+         labels = c("Definition 1", "Defintion 2", "Definition 3"))) %>%
+  ggplot(aes(x = value)) %>%
+  add(geom_point(aes(y = fever), shape = 1, size = 2)) %>%
+  add(geom_smooth(aes(y = fever), color = myCols[4], span = 0.5)) %>%
+  add(geom_smooth(aes(y = fever), method = "glm", se = FALSE, color = myCols[5])) %>%
+  add(facet_wrap(~variable)) %>%
+  add(theme_bw())
+```
+
+Previous studies have highlighted the possibility of duration being confounded by daycare attendance and duration of daycare attendance. In this data set the number of children in daycare was about 50%, so I'm very skeptical here.
+
+```{r}
+model.def.1 <- glm(fever ~ interval_def1 + day_care + offset(log(study_time)),
+                   family = poisson, 
+                   data = df.reduced)
+model.def.2 <- glm(fever ~ interval_def2 + day_care + offset(log(study_time)), 
+                   family = poisson, 
+                   data = df.reduced)
+model.def.3 <- glm(fever ~ interval_def3 + day_care + offset(log(study_time)), 
+                   family = poisson,
+                   data = df.reduced)
+
+models <- list(model.def.1, model.def.2, model.def.3)
+
+lapply(models, robustErrors)
+
+rateRatios2 <- function(model.object) {
+  cov.ml <- vcovHC(model.object, type = "HC0")
+  r.est.1 <- robustErrors(model.object)
+  s <- deltamethod(list(~exp(x1), ~ exp(x2), ~exp(x3)), coef(model.object), cov.ml)
+  rexp.est.1 <- exp(r.est.1[, -4]) # removing (uncorrected) p-values
+  rexp.est.1[,"Robust SE"] <- s
+  rexp.est.1
+}
+
+lapply(models, rateRatios2)
+```
+
+Diagnostics
+```{r}
+par(mfrow = c(3, 4))
+plot(model.def.1, main = "Definition 1")
+plot(model.def.2, main = "Definition 2")
+plot(model.def.3, main = "Definition 3")
+par(mfrow = c(1, 1))
+```
+
+Stratifying by those in daycare attendance
+
+```{r}
+df.reduced %>%
+  select(fever, contains('interval'), day_care) %>%
+  melt(id = c("fever","day_care")) %>%
+  mutate(variable = factor(variable,
+                           levels = c("interval_def1", "interval_def2", "interval_def3"),
+                           labels = c("Definition 1", "Defintion 2", "Definition 3")),
+         day_care = factor(day_care,
+                           levels = c(0, 1),
+                           labels = c("No Attendance","Attendance"))) %>%
+  ggplot(aes(x = value)) %>%
+  add(geom_point(aes(y = fever), shape = 1, size = 2)) %>%
+  add(geom_smooth(aes(y = fever), method = "glm")) %>%
+  add(facet_wrap( ~ variable + day_care, ncol = 2)) %>%
+  add(theme_bw())
+```
+
+## Longitudinal Approach
+
+### Investigating seasonality in HBoV-1 incidence
+
+```{r}
+# test.results.pos %>%
+#   dplyr::select(date_ct, id, log_q_per_ml) %>%
+#   dplyr::mutate(log_q_per_ml = ifelse(is.na(log_q_per_ml), 0, log_q_per_ml)) %>%
+#   ggplot(aes(x = date_ct)) %>%
+#   add(geom_point(aes(y = log_q_per_ml), color = "blue")) %>%
+#   add(labs(x = "Collection Date",
+#            y = "Log q/mL HBoV-1")) %>%
+#   add(theme_bw()) -> p
+# 
+# pdf("S:/MartinEpi/Analysis/Bocavirus Persistence Modeling/plots and figures/all_folks.pdf")
+# ggplus::facet_multiple(plot = p, facets = "id", ncol = 2, nrow = 4, scales = "free_x")
+# dev.off()
+
+temp <- test.results.pos %>%
+  select(date_ct) %>%
+  count(date_ct) %>%
+  rename(n.enroll = n)
+
+hbov.ts <- test.results.pos %>%
+  full_join(temp, by = "date_ct") %>%
+  select(date, bovpos, n.enroll) %>%
+  filter(bovpos != 0) %>%
+  arrange(date) %>%
+  mutate(bov = bovpos/n.enroll)
+
+cutXtsObjByWeek <- function(x, date, colname) {
+  # first, sum by day so there are no duplicate days
+  cut.frame <- aggregate(x ~ cut(date, "day"), 
+                         FUN = sum, na.rm = TRUE)
+  # change colnames, aggregate makes them ugly
+  colnames(cut.frame) <- c("date", as.character(colname))
+  # reformat date variable, aggregate converts to string
+  cut.frame$date <- as.Date(cut.frame$date, format = "%Y-%m-%d")
+  # make 'weeks' of data
+  cut.frame$week <- floor_date(cut.frame$date, "week") + 8
+  # sum `colname` by week
+  summarized <- aggregate(cut.frame[,colname] ~ cut.frame[,"week"],
+                          FUN = sum, na.rm = TRUE)
+  colnames(summarized) <- c("week","sumObj")
+  xts.obj <- xts(summarized$sumObj, order.by = summarized$week)
+}
+
+hbov.std.xts <- cutXtsObjByWeek(x = hbov.ts$bov, date = hbov.ts$date, colname = "hbov")
+hbov.xts <- cutXtsObjByWeek(x = hbov.ts$bovpos, date = hbov.ts$date, colname = "hbov")
+
+par(mfrow = c(1, 2))
+plot(hbov.xts, auto.grid = FALSE, main = "Raw")
+plot(hbov.std.xts, auto.grid = FALSE, main = "Standardized")
+par(mfrow = c(1, 1))
+```
+
+The difference between these last two plots is in proportion. On the left, 'raw' is the incidence of HBoV-1 (+) samples by date while 'standardized' is the resulting plot when dividing 'raw' by the number enrolled at that time point. Which is described by the following plot:
+
+```{r}
+with(temp, {
+  plot(date_ct, 
+       n.enroll, 
+       type = "l", 
+       main = "Child Enrollment Over Study Time",
+       xlab = "Study Week",
+       ylab = "Number Enrolled")
+})
+```
+
+The take-away is that there does not appear to be any seasonality in Bocavirus incidence during this study time.
+
+Investigating seasonality in fever incidence
+
+```{r}
+fevers <- diaries %>%
+  filter(!is.na(fever)) %>%
+  select(date, fever) %>%
+  arrange(date)
+
+fevers.xts <- cutXtsObjByWeek(x = fevers$fever, 
+                              date = fevers$date, 
+                              colname = "fever")
+
+plot(fevers.xts, auto.grid = FALSE)
+
+# Window/subset to time-periods with greater numbers of individuals
+
+fevers.subset <- fevers.xts["2000-02-01/2002-06-01"]
+plot(fevers.subset, auto.grid = FALSE)
+```
+
+Simple moving averages of the 'mean fevers by study week'
+
+```{r}
+par(mfrow = c(2, 2))
+ylim <- c(min(fevers.subset), max(fevers.subset))
+plot(fevers.subset, main = "Raw Time Series", auto.grid = FALSE)
+plot(ma(fevers.subset, 3), main = "Simple Moving Average (k = 3)", ylim = ylim)
+plot(ma(fevers.subset, 7), main = "Simple Moving Average (k = 7)", ylim = ylim)
+plot(ma(fevers.subset, 15), main = "Simple Moving Average (k = 15)", ylim = ylim)
+par(mfrow = c(1, 1))
+```
+
+Data do not appear seasonal, here we are trying to investigate seasonality but will come up short
+
+```{r}
+fevers.subset.ts <- ts(fevers.subset, start = start(fevers.subset), f = 52)
+
+seasonplot(fevers.subset.ts) # failure: no seasonal component
+monthplot(fevers.subset)
+
+# but wait, there's more
+fever.decomp <- decompose(fevers.subset.ts, type = "additive")
+plot(fever.decomp) # definitely doesn't appear to be seasonal
+```
+
+Let's try with the full symptom data, this should be seasonal
+
+```{r}
+symps <- arrange(select(diaries, date, symp_ct), date)
+symps <- aggregate(symp_ct ~ cut(symps$date, "day"), 
+                   data = symps,
+                   FUN = sum, 
+                   na.rm = TRUE)
+colnames(symps) <- c("date", "symp_ct")
+
+symps$date <- as.Date(symps$date, format = "%Y-%m-%d")
+symps$week <- floor_date(symps$date, "week") + 8
+
+symps.mean.wk <- ddply(symps, .(week), summarize, meanSymps = mean(symp_ct))
+symps.xts <- xts(symps.mean.wk$meanSymps, order.by = symps.mean.wk$week)
+plot(symps.xts, auto.grid = FALSE)
+
+# Window/subset to time-periods with greater numbers of individuals
+
+symps.subset <- symps.xts["1999-08-01/2002-06-01"]
+autoplot(symps.subset)
+
+symptoms.stl <- stl(ts(symps.mean.wk$meanSymps,
+                       start = c(1997, 8, 4), 
+                       freq = 52), 
+                    s.window = "periodic",
+                    robust = TRUE)
+autoplot(symptoms.stl)
+```
+
+We can definitely see seasonal effects in the data with [Rob J. Hyndman's](https://robjhyndman.com/) stl decomposition functions.
+
+```{r}
+season.decomp <- data.frame(week = symps.mean.wk$week,
+                            symps.season = as.numeric(symptoms.stl$time.series[,"seasonal"]))
+
+season.decomp %>% 
+  ggplot(aes(x = week)) %>% 
+  add(geom_point(aes(y = symps.season))) %>% 
+  add(stat_smooth(aes(y = symps.season), 
+                  method = "loess", span = 0.1, se = FALSE)) %>% 
+  add(scale_x_date(date_breaks = "6 months", date_labels = "%m/%Y")) %>% 
+  add(theme_minimal())
+```
+
+Eventually, we will adjust for the 'ill-season' effect in our final model, here average by month and year and save it.
+```{r}
+symptoms.agg <- season.decomp %>%
+  mutate(year.mon = floor_date(week, "month")) %>%
+  plyr::ddply("year.mon", summarise, symps.season = mean(symps.season))
+```
+
+### Tidying data for longitudinal modelling
+
+```{r}
+dem.dur <- dem.clin.dat %>%
+  right_join(durations, by = "id") %>%
+  select(-patient) %>%
+  mutate(id = factor(id))
+
+# defined as >= 2 of the following: fever, cough, runnynose, 
+# vomit, diarrhea, general.rash, local.rash, diaper.rash, fussy,
+# seizure, drvisit
+ill.symptoms.df <- diaries %>%
+  mutate(drvisit = ifelse(drvisit == 5, 1, drvisit),
+         ill.symptoms = rowSums(.[c(6,8:17)], na.rm = TRUE)) %>%
+  select(id, date, ill.symptoms) %>%
+  arrange(id, date)
+
+ill.symptoms.df <- aggregate(ill.symptoms ~ cut(ill.symptoms.df$date, "day") + id,
+                             data = ill.symptoms.df,
+                             FUN = sum,
+                             na.rm = TRUE)
+colnames(ill.symptoms.df) <- c("date", "id", "ill.symptoms")
+
+dem.dur.symp.long <- ill.symptoms.df %>%
+  mutate(date = as.Date(date, format = "%Y-%m-%d")) %>%
+  right_join(dem.dur, by = "id") %>%
+  mutate(id = factor(id))
+
+# just fevers
+
+fevers <- diaries %>%
+  select(id, date, fever) %>%
+  arrange(date)
+
+fevers <- aggregate(fever ~ cut(fevers$date, "day") + id,
+                    data = fevers, 
+                    FUN = sum, 
+                    na.rm = TRUE)
+colnames(fevers) <- c("date","id", "fever")
+fevers <- mutate(fevers, date = as.Date(date, format = "%Y-%m-%d"))
+
+dem.dur.fever.long <- fevers %>%
+  right_join(dem.dur, by = "id") %>%
+  mutate(id = factor(id))
+```
+
+Subsetting by fever dates and persistent infection duration (start and ending)
+
+```{r}
+cutToDuration <- function(df, def.date, symp, cutIll = FALSE) {
+  require(dplyr)
+  filtered <- filter(df, as.Date(df$date) >= as.Date(df[,def.date]))
+  filtered$week <- floor_date(filtered$date, "week")
+  aggregated <- aggregate(filtered[,symp] ~ filtered$week + filtered$id, FUN = sum)
+  colnames(aggregated) <- c("week","id", symp)
+  merged <- dem.clin.dat %>%
+    right_join(aggregated, by = "id") %>%
+    mutate(id = factor(id),
+           year.mon = floor_date(week, "month"))
+  if (cutIll) {
+    merged[,symp][merged[,symp] < 2] <- 0
+  }
+  merged
+}
+
+# Fevers
+fever.dat.def.1 <- cutToDuration(dem.dur.fever.long,
+                                 def.date = "first_date_def1",
+                                 symp = "fever")
+fever.dat.def.2 <- cutToDuration(dem.dur.fever.long, 
+                                 def.date = "first_date_def2",
+                                 symp = "fever")
+fever.dat.def.3 <- cutToDuration(dem.dur.fever.long, 
+                                 def.date = "first_date_def3",
+                                 symp = "fever")
+# Illness symptoms
+ill.dat.def.1 <- cutToDuration(dem.dur.symp.long,
+                               def.date = "first_date_def1",
+                               symp = "ill.symptoms",
+                               cutIll = TRUE)
+ill.dat.def.2 <- cutToDuration(dem.dur.symp.long,
+                               def.date = "first_date_def2",
+                               symp = "ill.symptoms",
+                               cutIll = TRUE)
+ill.dat.def.3 <- cutToDuration(dem.dur.symp.long,
+                               def.date = "first_date_def3",
+                               symp = "ill.symptoms",
+                               cutIll = TRUE)
+```
+
+```{r, message = FALSE, warning = FALSE}
+reduceFunction <- function(df, def, symp) {
+  ct <- df[,symp]
+  id <- as.numeric(rownames(df))
+  def <- as.character(def)
+  func.df <- data.frame(ct = ct,
+                        id = id,
+                        def = def) 
+}
+
+df1 <- reduceFunction(fever.dat.def.1, def = "Def. 1", symp = "fever")
+df2 <- reduceFunction(fever.dat.def.2, def = "Def. 2", symp = "fever")
+df3 <- reduceFunction(fever.dat.def.3, def = "Def. 3", symp = "fever")
+
+df <- data.frame(rbind(df1, df2, df3))
+
+df %>%
+  ggplot() %>%
+  add(geom_histogram(aes(x = ct))) %>%
+  add(facet_wrap( ~def, scales = "fixed")) %>%
+  add(labs(x = "Fever")) %>%
+  add(theme_bw())
+
+rm(df, df1, df2, df3)
+```
+
+They look almost exactly alike, the distributions will differ though. If we simply don't have enough fevers on record we may enumerate more symptoms
+
+### Time-Dependent Covariate Generation
+
+Add seasonal effect
+```{r}
+fever.dat.def.1 <- left_join(fever.dat.def.1, symptoms.agg, by = "year.mon")
+fever.dat.def.2 <- left_join(fever.dat.def.2, symptoms.agg, by = "year.mon")
+fever.dat.def.3 <- left_join(fever.dat.def.3, symptoms.agg, by = "year.mon")
+
+ill.dat.def.1 <- left_join(ill.dat.def.1, symptoms.agg, by = "year.mon")
+ill.dat.def.2 <- left_join(ill.dat.def.2, symptoms.agg, by = "year.mon")
+ill.dat.def.3 <- left_join(ill.dat.def.3, symptoms.agg, by = "year.mon")
+```
+
+Make a time-varying covariate for daycare attendance
+
+```{r}
+# fevers
+fever.dat.def.1 %<>%
+  mutate(daycare_dummy = ifelse((as.Date(daycare.start) <= as.Date(week)) & 
+                                  (as.Date(week) <= as.Date(daycare.end)), 1, 0))
+fever.dat.def.2 %<>%
+  mutate(daycare_dummy = ifelse((as.Date(daycare.start) <= as.Date(week)) & 
+                                  (as.Date(week) <= as.Date(daycare.end)), 1, 0))
+fever.dat.def.3 %<>%
+  mutate(daycare_dummy = ifelse((as.Date(daycare.start) <= as.Date(week)) & 
+                                  (as.Date(week) <= as.Date(daycare.end)), 1, 0))
+
+# illness symptoms
+ill.dat.def.1 %<>%
+  mutate(daycare_dummy = ifelse((as.Date(daycare.start) <= as.Date(week)) & 
+                                  (as.Date(week) <= as.Date(daycare.end)), 1, 0))
+ill.dat.def.2 %<>%
+  mutate(daycare_dummy = ifelse((as.Date(daycare.start) <= as.Date(week)) & 
+                                  (as.Date(week) <= as.Date(daycare.end)), 1, 0))
+ill.dat.def.3 %<>%
+  mutate(daycare_dummy = ifelse((as.Date(daycare.start) <= as.Date(week)) & 
+                                  (as.Date(week) <= as.Date(daycare.end)), 1, 0))
+```
+
+Make baseline fever count for each patient, prior to infection start and subset to date start
+
+```{r, eval=TRUE, echo=FALSE}
+makeBaseline <- function(df, def.date) {
+  require(plyr); require(dplyr)
+  baseline <- df %>%
+    filter(as.Date(date) < as.Date(df[,def.date])) %>%
+    ddply("id", summarise, base.fever = sum(fever))
+}
+
+baseline.fev.1 <- makeBaseline(df = dem.dur.fever.long, 
+                               def.date = "first_date_def1")
+
+baseline.fev.2 <- makeBaseline(df = dem.dur.fever.long, 
+                               def.date = "first_date_def2")
+
+baseline.fev.3 <- makeBaseline(df = dem.dur.fever.long, 
+                               def.date = "first_date_def3")
+
+par(mfrow = c(1, 3))
+hist(baseline.fev.1$base.fever, 
+     col = "grey", 
+     main = "Histogram of Fevers Prior to HBoV-1 Infx \nPersistence Definition 1",
+     xlab = "Fever Frequency based on 66 patients",
+     breaks = 21)
+hist(baseline.fev.2$base.fever, 
+     col = "grey", 
+     main = "Histogram of Fevers Prior to HBoV-1 Infx \nPersistence Definition 2",
+     xlab = "Fever Frequency based on 66 patients",
+     breaks = 21)
+hist(baseline.fev.3$base.fever, 
+     col = "grey", 
+     main = "Histogram of Fevers Prior to HBoV-1 Infx \nPersistence Definition 3",
+     xlab = "Fever Frequency based on 66 patients",
+     breaks = 21)
+par(mfrow = c(1, 1))
+
+fever.dat.def.1 <- merge(fever.dat.def.1, baseline.fev.1, by = "id")
+fever.dat.def.2 <- merge(fever.dat.def.2, baseline.fev.2, by = "id")
+fever.dat.def.3 <- merge(fever.dat.def.3, baseline.fev.3, by = "id")
+```
+
+Baseline Illness symptoms
+```{r}
+reduceSymptoms <- function(df, def.date) {
+  require(plyr); require(dplyr)
+  baseline.ill <- df %>%
+    filter(as.Date(date) < as.Date(df[,def.date])) %>%
+    mutate(week = floor_date(date, "week")) %>%
+    ddply(.(id, week), summarise, base.ill = sum(ill.symptoms)) %>%
+    mutate(base.ill = ifelse(base.ill < 2, 0, base.ill)) %>%
+    ddply("id", summarise, base.ill = sum(base.ill))
+  baseline.ill
+}
+
+baseline.ill.1 <- reduceSymptoms(df = dem.dur.symp.long,
+                                 def.date = "first_date_def1")
+
+baseline.ill.2 <- reduceSymptoms(df = dem.dur.symp.long,
+                                 def.date = "first_date_def2")
+
+baseline.ill.3 <- reduceSymptoms(df = dem.dur.symp.long,
+                                 def.date = "first_date_def3")
+
+ill.dat.def.1 <- merge(ill.dat.def.1, baseline.ill.1, by = "id")
+ill.dat.def.2 <- merge(ill.dat.def.2, baseline.ill.2, by = "id")
+ill.dat.def.3 <- merge(ill.dat.def.3, baseline.ill.3, by = "id")
+```
+
+Finally, add a time variable
+
+```{r}
+timeRank <- function(x) {
+  plyr::ddply(x, "id", transform, time = rank(id, ties.method = "first"))
+}
+
+# fever data
+fever.data <- list(def.1 = fever.dat.def.1,
+                   def.2 = fever.dat.def.2, 
+                   def.3 = fever.dat.def.3)
+
+fever.data <- lapply(fever.data, FUN = timeRank)
+
+# illness symptom data
+ill.data <- list(def.1 = ill.dat.def.1,
+                 def.2 = ill.dat.def.2, 
+                 def.3 = ill.dat.def.3)
+
+ill.data <- lapply(ill.data, FUN = timeRank)
+```
+
+Add viral load data
+```{r}
+viral.loads <- test.results.pos %>%
+  select(id, log_q_per_ml, date) %>%
+  mutate(id = factor(id),
+         week = floor_date(date, "week")) %>%
+  filter(!is.na(log_q_per_ml)) %>%
+  arrange(id, week) %>%
+  select(-date) %>%
+  ddply(.(id, week), summarize, 
+        log_q_per_ml = mean(log_q_per_ml))
+
+# I'm relying on this function to look up for viral.loads
+addViralLoad <- function(x) {
+  # merge
+  left_join(x, viral.loads, by = c("id", "week"))
+}
+
+replaceNA <- function(x) {
+  x$log_q_per_ml[is.na(x$log_q_per_ml)] <- 0; x
+}
+
+# symptom data
+ill.data <- lapply(ill.data, FUN = addViralLoad)
+ill.data <- lapply(ill.data, FUN = replaceNA)
+# fever data
+fever.data <- lapply(fever.data, FUN = addViralLoad)
+fever.data <- lapply(fever.data, FUN = replaceNA)
+```
+
+### Descriptive Statistics
+
+Some descriptive statistics, number of weeks of follow-up/persistent infection duration
+
+```{r, echo = FALSE, eval = TRUE}
+listFunc <- function(x) {
+  min = min(table(x$id))
+  max  = max(table(x$id))
+  median = median(table(x$id))
+  person.weeks = length(x$id)
+  return(list(min = min, 
+              max = max, 
+              median = median, 
+              person.weeks = person.weeks))
+}
+
+knitr::kable(sapply(fever.data, listFunc))
+```
+
+Some descriptives for mean and variance of fever count outcome
+
+```{r, echo=FALSE, eval=TRUE}
+listFunc2 <- function(x) {
+  max = max(x$fever)
+  mean = mean(x$fever)
+  var = var(x$fever)
+  dispersion = var/mean
+  return(list(max = max, 
+              mean = mean, 
+              var = var, 
+              dispersion = dispersion))
+}
+
+knitr::kable(sapply(fever.data, listFunc2))
+```
+
+This indicates that the variance is often greater than 2 times the mean. This is problematic in developing a straight poisson model glmm that does not account for this dispersion.
+
+### Visual description of longitudinal data
+
+```{r}
+sec.axis <- sec_axis(~./1, name = "Illness Symptoms")
+ill.data$def.1 %>% 
+  filter(id %in% c(166, 285, 179, 317, 208, 151)) %>%
+  ggplot(aes(x = time)) %>%
+  add(geom_bar(aes(y = log_q_per_ml, fill = "Log10 Copies/mL"),
+               stat = "identity", alpha = 0.8, width = 1)) %>%
+  add(geom_point(aes(y = ill.symptoms * 1, group = 1, color = "Illness Symptoms"),
+                alpha = 0.8,
+                size = 2)) %>%
+  add(scale_color_manual("",
+                         values = c("Log10 Copies/mL" = "grey",
+                                    "Illness Symptoms" = "red"))) %>%
+  add(scale_fill_manual(" ", values = "grey50")) %>%
+  add(scale_y_continuous(sec.axis = sec.axis)) %>%
+  add(facet_wrap(~id, scales = "free_x")) %>%
+  add(theme_bw()) %>%
+  add(labs(x = "Study Follow-Up, Weeks",
+           y = expression(paste("Log"[10], " Copies/mL HBoV-1")))) %>%
+  add(theme(legend.position = "bottom"))
+```
+
+```{r, eval=TRUE, echo=FALSE}
+fever.data$def.1$day_care <- factor(fever.data$def.1$day_care, 
+                                    levels = c(0, 1), 
+                                    labels = c("No Daycare", "Daycare"))
+fever.data$def.2$day_care <- factor(fever.data$def.2$day_care, 
+                                    levels = c(0, 1), 
+                                    labels = c("No Daycare", "Daycare"))
+fever.data$def.3$day_care <- factor(fever.data$def.3$day_care,
+                                    levels = c(0, 1),
+                                    labels = c("No Daycare", "Daycare"))
+```
+
+Spaghetti plots
+```{r}
+fever.data$def.3 %>%
+  ggplot(aes(x = time, y = fever, group = id)) %>%
+  add(geom_line(alpha = 0.2)) %>%
+  add(geom_smooth(aes(group = 1), 
+                  method = "glm")) %>%
+  add(stat_summary(aes(group = 1), 
+                   geom = "point", 
+                   fun.y = mean, 
+                   shape = 17, 
+                   size = 1, 
+                   color = "red")) %>%
+  add(labs(x = "Study Follow-Up Time, Weeks",
+           y = "Fever Incidence")) %>%
+  add(theme_bw())
+
+ill.data$def.1 %>%
+  ggplot(aes(x = time, y = ill.symptoms, group = id)) %>%
+  add(geom_line(alpha = 0.2)) %>%
+  add(geom_smooth(aes(group = 1), 
+                  method = "glm")) %>%
+  add(stat_summary(aes(group = 1), 
+                   geom = "point", 
+                   fun.y = mean, 
+                   shape = 17, 
+                   size = 1, 
+                   color = "red")) %>%
+  add(facet_wrap(~siblings)) %>%
+  add(labs(x = "Study Follow-Up Time, Weeks",
+           y = "ARI Symptom Incidence")) %>%
+  add(theme_bw())
+```
+
+Visually, this is very difficult to assess any effect whatsoever what with the abundance of zeros and all. Coefficients from models may be able to tell us a little more.
+
+### Data for plots of mean and bootstrapped CI
+
+Data and plots done separately for non-zero data (s.t1) and zero vs. non-zero (s.t2).
+These are the means and 95% CI for number of fevers and proportion of individuals with fevers
+
+```{r}
+levels <- c(0, 1)
+vars <- c("day_care","female","siblings")
+labels <- list(dc_labels = c("No Daycare", "Daycare"),
+               gen_labels = c("Male", "Female"),
+               sib_labels = c("No siblings", "Siblings"))
+
+factorEr <- function(df, vars, levels, labels) {
+  for (i in 1:length(vars)) {
+    df[,vars[i]] <- factor(df[,vars[i]], 
+                           levels = levels, 
+                           labels = labels[[i]])
+  }
+  df
+}
+
+stMeansCIs <- function(df, vars, symp, levels, labels) {
+  require(Hmisc)
+  st_names <- c(vars, symp, "Lower","Upper")
+  # without symp == 0 (non-zero data)
+  t1 <- df[df[,symp] > 0, ]
+  llist <- llist(t1[,vars[1]], t1[,vars[2]], t1[,vars[3]])
+  s.t1 <- Hmisc::summarize(t1[,symp], 
+                           by = llist, 
+                           FUN = smean.cl.boot, 
+                           conf.int = 0.80)
+  colnames(s.t1) <- st_names
+  s.t1 <- factorEr(s.t1, vars, levels, labels)
+  # zero vs. non-zero data
+  t2 <- df
+  llist <- llist(t2[,vars[1]], t2[,vars[2]], t2[,vars[3]])
+  s.t2 <- Hmisc::summarize(t2[,symp] > 0,
+                           by = llist,
+                           FUN = smean.cl.boot,
+                           conf.int = 0.80)
+  colnames(s.t2) <- st_names
+  s.t2 <- factorEr(s.t2, vars, levels, labels)
+  list(s.t1 = s.t1, s.t2 = s.t2)
+}
+
+st.def1 <- stMeansCIs(fever.dat.def.1, 
+                      vars = vars, 
+                      symp = "fever", 
+                      levels = levels, 
+                      labels = labels)
+
+st.def2 <- stMeansCIs(fever.dat.def.2, 
+                      vars = vars, 
+                      symp = "fever", 
+                      levels = levels, 
+                      labels = labels)
+
+st.def3 <- stMeansCIs(fever.dat.def.3,
+                      vars = vars, 
+                      symp = "fever", 
+                      levels = levels, 
+                      labels = labels)
+```
+
+To plot M and CI via lattice, we'll use the panel.errbars function from memisc package
+
+```{r, echo=FALSE, eval=TRUE}
+panel.errbars1 <- function(x, y0, y1, ewidth = 0){
+  x <- as.numeric(x)
+  offs <- ewidth/2
+  panel.segments(x0 = x, x1 = x, y0 = y0, y1 = y1)
+  panel.segments(x0 = x - offs, x1 = x + offs, y0 = y0, y1 = y0)
+  panel.segments(x0 = x - offs, x1 = x + offs, y0 = y1, y1 = y1)
+}
+
+panel.errbars <- function(x, y, ..., 
+                          panel.xy = panel.xyplot,
+                          make.grid = c("horizontal","vertical","both","none"),
+                          ewidth = 0) {
+  Y <- matrix(y, nrow = length(y)/3, ncol = 3)
+  y <- Y[,1]
+  y0 <- Y[,2]
+  y1 <- Y[,3]
+  make.grid <- match.arg(make.grid)
+  if (make.grid == "horizontal") { panel.grid(h = -1, v = 0) }
+  else if (make.grid == "vertical") { panel.grid(v = -1, h = 0) }
+  else if (make.grid == "both") { panel.grid(v = -1, h = -1) }
+  panel.errbars1(x, y0, y1, ewidth = ewidth)       
+  panel.xy(x, y, ...)
+}
+
+plotBootCI <- function(st.list, symp, ...) {
+  require(memisc)
+  par.settings <- simpleTheme(pch = c(17,19), lwd = 2, cex = 1.1, col = c("black", grey(0.5)))
+  auto.key <- list(x = 0.05, y = 0.85, lines = FALSE, columns = 1, border = FALSE, file = "white")
+  ob1 <- xyplot(cbind(st.list[[1]][,symp], Lower, Upper) ~ day_care | female,
+                data = st.list[[1]],
+                panel = panel.errbars, 
+                groups = siblings,
+                ewidth = 0.10,
+                par.settings = par.settings, 
+		            auto.key = auto.key,
+		            ylab = ylabel[1],
+		            xlab = xlabel[1],
+	      	      type = "b")
+  auto.key <- list(x = 0.05, y = 0.30, lines = FALSE, columns = 1, border = FALSE, file = "white")
+  ob2 <- xyplot(cbind(st.list[[2]][,symp], Lower, Upper) ~ day_care | female,
+                data = st.list[[2]],
+                panel = panel.errbars, 
+                groups = siblings,
+                ewidth = 0.10,
+                par.settings = par.settings, 
+		            auto.key = auto.key,
+		            ylab = ylabel[2],
+		            xlab = xlabel[2],
+	      	      type = "b")
+  print(ob1, split = c(1, 1, 1, 2), more = TRUE)
+  print(ob2, split = c(1, 2, 1, 2))
+}
+
+xlabel <- c("", "Daycare vs. No Daycare Attendance")
+ylabel <- c("Number of Fevers", "Proportion of Fevers")
+plotBootCI(st.def1, symp = "fever", xlabel = xlabel, ylabel = ylabel)
+plotBootCI(st.def2, symp = "fever", xlabel = xlabel, ylabel = ylabel)
+plotBootCI(st.def3, symp = "fever", xlabel = xlabel, ylabel = ylabel)
+```
+
+```{r}
+# png("S:/MartinEpi/Analysis/Bocavirus Persistence Modeling/plots and figures/daycare_sibs_gender_fevers1.png",
+#     width = 7, height = 7, units = "in", res = 500)
+# plotBootCI(st.def1)
+# dev.off()
+```
+
+This time now by symptoms over time
+
+```{r}
+st.def1 <- stMeansCIs(ill.dat.def.1, 
+                      vars = vars, 
+                      symp = "ill.symptoms", 
+                      levels = levels, 
+                      labels = labels)
+
+st.def2 <- stMeansCIs(ill.dat.def.2, 
+                      vars = vars, 
+                      symp = "ill.symptoms", 
+                      levels = levels, 
+                      labels = labels)
+
+st.def3 <- stMeansCIs(ill.dat.def.3,
+                      vars = vars, 
+                      symp = "ill.symptoms", 
+                      levels = levels, 
+                      labels = labels)
+
+xlabel <- c("", "Daycare vs. No Daycare Attendance")
+ylabel <- c("Number of Ill Symptoms", "Proportion of Ill Symptoms")
+plotBootCI(st.def1, symp = "ill.symptoms", xlabel = xlabel, ylabel = ylabel)
+plotBootCI(st.def2, symp = "ill.symptoms", xlabel = xlabel, ylabel = ylabel)
+plotBootCI(st.def3, symp = "ill.symptoms", xlabel = xlabel, ylabel = ylabel)
+```
+
+```{r, eval = TRUE, echo = FALSE}
+detach("package:Hmisc")
+```
+
+### Examining fevers and HBoV-1 incidence over time
+
+```{r}
+fevers2 <- fevers %>%
+  mutate(id = as.character(id)) %>%
+  filter(id %in% id$id) %>%
+  mutate(week = floor_date(date, "week")) %>%
+  plyr::ddply(plyr::.(week, id), summarise, 
+              value = sum(fever, na.rm = TRUE)) %>%
+  mutate(variable = "Fever") %>%
+  arrange(id, week)
+
+pos.week <- test.results.pos %>%
+  mutate(id = as.character(id),
+         week = floor_date(date, "week"),
+         value = ifelse(is.na(log_q_per_ml), 0, log_q_per_ml),
+         variable = "log q/ml") %>%
+  select(week, id, value, variable) %>%
+  arrange(id, week)
+  
+bov_n_fevers <- fevers2 %>%
+  bind_rows(pos.week) %>%
+  dcast(id + week ~ variable, fun.aggregate = sum) %>%
+  arrange(id, week) %>%
+  plyr::ddply("id", mutate, time = seq_along(id))
+
+# sec.axis <- sec_axis(~./2, name = "Fever")
+# p <- bov_n_fevers %>%
+#   dplyr::rename(log_q_per_ml = `log q/ml`) %>%
+#   mutate(Fever = ifelse(Fever == 0, NA, Fever)) %>%
+#   ggplot(aes(x = time)) %>%
+#   add(geom_bar(aes(y = log_q_per_ml, fill = "Log10 Copies/mL"),
+#                stat = "identity", alpha = 0.8, width = 1)) %>%
+#   add(geom_point(aes(y = Fever * 2, group = 1, color = "Fever"), 
+#                  alpha = 0.8,
+#                  size = 2)) %>%
+#   add(scale_color_manual(" ", 
+#                          values = c("Log10 Copies/mL"="grey",
+#                                     "Fever"="red"))) %>%
+#   add(scale_fill_manual(" ", values = "grey50")) %>%
+#   add(scale_y_continuous(sec.axis = sec.axis)) %>%
+#   add(theme_bw()) %>%
+#   add(labs(x = "Study Follow-Up, Weeks",
+#            y = expression(paste("Log"[10], " Copies/mL HBoV-1")))) %>%
+#   add(theme(legend.position = "bottom"))
+
+# pdf("S:/MartinEpi/Analysis/Bocavirus Persistence Modeling/plots and figures/bov_by_fever.pdf")
+# ggplus::facet_multiple(plot = p,
+#                        facets = "id",
+#                        ncol = 2, nrow = 4,
+#                        scales = "free_x")
+# dev.off()
+
+sec.axis <- sec_axis(~./2, name = "Fever")
+bov_n_fevers %>%
+  rename(log_q_per_ml = `log q/ml`) %>%
+  filter(id %in% c(166, 285, 179, 317, 208, 151)) %>%
+  mutate(Fever = ifelse(Fever == 0, NA, Fever)) %>%
+  ggplot(aes(x = time)) %>%
+  add(geom_bar(aes(y = log_q_per_ml, fill = "Log10 Copies/mL"),
+               stat = "identity", alpha = 0.8, width = 1)) %>%
+  add(geom_point(aes(y = Fever * 2, group = 1, color = "Fever"), 
+                 alpha = 0.8,
+                 size = 2)) %>%
+  add(scale_color_manual(" ", 
+                         values = c("Log10 Copies/mL" = "grey",
+                                    "Fever" = "red"))) %>%
+  add(scale_fill_manual(" ", values = "grey50")) %>%
+  add(scale_y_continuous(sec.axis = sec.axis)) %>%
+  add(facet_wrap(~id, scales = "free_x")) %>%
+  add(theme_bw()) %>%
+  add(labs(x = "Study Follow-Up, Weeks",
+           y = expression(paste("Log"[10], " Copies/mL HBoV-1")))) %>%
+  add(theme(legend.position = "bottom"))
+```
+
+Fevers really don't seem to be tied to HBoV-1 incidence. The fever 'points' are more or less randomly distributed among the 'forest' of HBoV-1 samples.
+
+Next I want to cut the data to only the length of the primary infection duration
+```{r}
+# merge and filter
+durations_week <- durations
+durations_week[,c(2,3,6,9,10)] <- lapply(durations[,c(2,3,6,9,10)],
+                                         FUN = function(x) floor_date(x, "week"))
+
+test <- durations %>%
+  select(-patient) %>%
+  left_join(bov_n_fevers, by = "id") %>%
+  left_join(select(dem.clin.dat, -race, -race_text), by = "id")
+
+durations_cut <- durations %>%
+  select(-patient) %>% 
+  left_join(test.results.pos, by = "id") %>%
+  left_join(dplyr::select(dem.clin.dat, -race, -race_text), by = "id") %>%
+  filter((first_date_def1 <= date & date <= end_date_def1_and_2) |
+         (first_date_def2 <= date & date <= end_date_def1_and_2) |
+         (first_date_def3 <= date & date <= end_date_def3)) %>%
+  select(id, date, everything()) %>%
+  mutate(week = floor_date(date, "week"))
+
+# further split by definition and add week counter
+cutDuration <- function(df, start.date, end.date) {
+  require(dplyr)
+  filtered <- df %>% 
+    filter(start.date <= date & date <= end.date) %>%
+    arrange(id, date) %>%
+    plyr::ddply("id", mutate, time = seq_along(id))
+  filtered
+}
+
+duration_def1 <- cutDuration(durations_cut,
+                             start.date = durations_cut$first_date_def1,
+                             end.date = durations_cut$end_date_def1_and_2)
+
+duration_def2 <- cutDuration(durations_cut,
+                             start.date = durations_cut$first_date_def2,
+                             end.date = durations_cut$end_date_def1_and_2)
+
+duration_def3 <- cutDuration(durations_cut,
+                             start.date = durations_cut$first_date_def3,
+                             end.date = durations_cut$end_date_def3)
+
+tmp_list <- list(def1 = duration_def1,
+                 def2 = duration_def2,
+                 def3 = duration_def3)
+sapply(tmp_list, listFunc)
+rm(tmp_list)
+```
+
+```{r}
+col.set <- brewer.pal(3, "Set1")
+ids <- sample(names(which(table(duration_def1$id) > 10)), 10)
+p <- duration_def1 %>%
+  filter(id %in% ids) %>%
+  ggplot(aes(x = time, y = log_q_per_ml)) %>%
+  add(geom_point()) %>%
+  add(stat_smooth(aes(group = 1, color = "Cubic Spline"), 
+                  method = "lm",
+                  formula = y ~ splines::ns(x, 3), 
+                  se = FALSE)) %>%
+  add(stat_smooth(aes(group = 1, color = "Linear Model"), 
+                  method = "gam", 
+                  se = FALSE)) %>%
+  add(facet_wrap(~id, ncol = 5, scales = "free")) %>%
+  add(theme_bw()) %>%
+  add(labs(
+    x = "\n Duration of Infection, weeks",
+    y = expression(paste("HBoV-1 Log"[10], " Copies/mL")),
+    color = "Method",
+    caption = "Limited to infections spanning \u2265 10 weeks"
+    )) %>%
+  add(theme(legend.position = "bottom")) %>%
+  add(scale_color_manual(values = c(col.set[2], col.set[1])))
+p
+
+# png("S:/MartinEpi/Analysis/Bocavirus Persistence Modeling/plots and figures/boca_gam_lm.png",
+#     width = 10, height = 6, units = "in", res = 500)
+# p
+# dev.off()
+```
+
+### Shape of the infectivity curve
+
+```{r}
+p <- duration_def1 %>%
+  filter(id %in% names(which(table(.$id) > 10))) %>%
+  filter(!is.na(log_q_per_ml)) %>%
+  ggplot(aes(x = time)) %>% 
+  add(geom_line(aes(y = log_q_per_ml, color = id), size = 1.05)) %>%
+  add(geom_smooth(aes(y = log_q_per_ml),
+                  method = "gam",
+                  formula = y ~ splines::bs(x, knots = c(0, 1, 4)),
+                  color = "black",
+                  se = FALSE,
+                  size = 1.5)) %>%
+  add(theme_bw()) %>%
+  add(scale_x_continuous(breaks = seq(0, 30, by = 5),
+                         limits = c(0, 30))) %>%
+  add(theme(legend.position = c(0.95, 0.7))) %>%
+  add(labs(x = "\n Weeks from Infection Start", 
+           y = "log10 HBoV-1/mL\n", 
+           color = "Infant ID",
+           caption = "Limited to infections spanning \u2265 12 weeks"))
+p
+```
+
+#### GAM and GAMM modelling
+
+The shape of the curve is non-linear, as with most biological curves. Generalized Additive Models (GAM) can estimate these curves with penalized spline terms. Further, Generalized Additive Mixed Models (GAMM) can take into account the random effect of different individual experiences, which is ultimately what we want to model. 
+
+```{r}
+library(mgcv)
+
+df_10 <- filter(duration_def1, id %in% names(which(table(duration_def1$id) > 10)))
+gam_fit <- gam(log_q_per_ml ~ s(time, k = -1, bs = "cr"),
+               family = gaussian(link = identity),
+               data = df_10)
+sp <- gam_fit$sp
+summary(gam_fit)
+par(mfrow = c(2, 3))
+with(df_10, plot(time, log_q_per_ml))
+plot(gam_fit, select = 1, shade = TRUE)
+gam.check(gam_fit)
+
+# png("S:/MartinEpi/Analysis/Bocavirus Persistence Modeling/plots and figures/gam.png",
+#     width = 12, height = 8, units = "in", res = 700)
+# par(mfrow = c(2, 3))
+# with(duration_def1, plot(time, log_q_per_ml))
+# plot(gam_fit, select = 1, shade = TRUE)
+# gam.check(gam_fit)
+# dev.off()
+
+# find best smooth by aic/bic
+tuning.scale <- c(1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1, 1e2, 1e3, 1e4, 1e5)
+scale.exponent <- log10(tuning.scale)
+n.tuning <- length(tuning.scale)
+edf <- rep(NA, n.tuning)
+min211 <- rep(NA, n.tuning)
+aic <- rep(NA, n.tuning)
+bic <- rep(NA, n.tuning)
+
+for(i in 1:n.tuning) {
+  gam_fit <- gam(log_q_per_ml ~ s(time),
+               family = gaussian(link = identity),
+               data = df_10,
+               sp = tuning.scale[i] * sp)
+  min211[i] <- -2 * logLik(gam_fit)
+  edf[i] <- sum(gam_fit$edf) + 1
+  aic[i] <- AIC(gam_fit)
+  bic[i] <- BIC(gam_fit)
+}
+
+par(mfrow = c(2, 2))
+plot(scale.exponent, min211, type = "b", main = "-2 log likelihood")
+plot(scale.exponent, edf, type = "b", main = "effect number")
+plot(scale.exponent, aic, type = "b", main = "AIC")
+plot(scale.exponent, bic, type = "b", main = "BIC")
+
+# scaling corresponding to minimum bic
+min.bic <- 1e100
+opt.tuning.scale <- NULL
+for (i in 1:n.tuning) {
+  if (bic[i] < min.bic) {
+    min.bic <- bic[i]
+    opt.tuning.scale <- tuning.scale[i]
+  }
+}
+
+opt.sp <- opt.tuning.scale * sp
+opt.sp
+
+gam_fit <- gam_fit <- gam(log_q_per_ml ~ s(time),
+                          family = gaussian(link = identity),
+                          data = df_10,
+                          sp = opt.sp)
+
+par(mfrow = c(2, 3))
+with(df_10, plot(time, log_q_per_ml))
+plot(gam_fit, select = 1, shade = TRUE)
+gam.check(gam_fit)
+par(mfrow = c(1, 1))
+
+visreg(gam_fit)
+
+# png("S:/MartinEpi/Analysis/Bocavirus Persistence Modeling/plots and figures/infection_curve.png",
+#     width = 10, height = 8, units = "in", res = 500)
+# p
+# dev.off()
+
+p <- duration_def1 %>%
+  filter(id %in% names(which(table(.$id) > 12))) %>%
+  filter(!is.na(log_q_per_ml)) %>%
+  ggplot(aes(x = time)) %>% 
+  add(geom_point(aes(y = log_q_per_ml))) %>%
+  add(geom_smooth(aes(y = log_q_per_ml),
+                  method = "gam",
+                  formula = y ~ s(x),
+                  color = "red", 
+                  alpha = 0.1,
+                  se = FALSE)) %>%
+  add(facet_wrap(~id)) %>%
+  add(theme_bw()) %>%
+  add(scale_x_continuous(breaks = seq(0, 30, by = 5),
+                         limits = c(0, 30))) %>%
+  add(theme(legend.position = c(0.95, 0.6))) %>%
+  add(labs(x = "\n Weeks from Infection Start", 
+           y = "log10 HBoV-1/mL\n",
+           caption = "Limited to infections spanning \u2265 10 weeks"))
+p
+
+# png("S:/MartinEpi/Analysis/Bocavirus Persistence Modeling/plots and figures/infection_curve_individual.png",
+#     width = 12, height = 10, units = "in", res = 500)
+# p
+# dev.off()
+```
+
+GAMM
+
+```{r}
+library(itsadug)
+df_red <- df_10 %>%
+  mutate(id = factor(id),
+         siblings = factor(siblings, 
+                           levels = c(0, 1), 
+                           labels = c("No", "Yes")),
+         day_care = factor(day_care,
+                           levels = c(0, 1),
+                           labels = c("No", "Yes")),
+         female = factor(female,
+                         levels = c(0, 1),
+                         labels = c("Male", "Female")),
+         bf_duration = ifelse(is.na(bf_duration), 0, bf_duration)) %>%
+  select(log_q_per_ml, siblings, day_care, female, bf_duration, time, id) %>%
+  filter(!is.na(log_q_per_ml))
+```
+
+Simple GAM with spline for time by day_care attendance
+
+```{r}
+dc_gam_1 <- gam(log_q_per_ml ~ day_care + s(time, by = day_care),
+                data = df_red)
+summary(dc_gam_1)
+par(mfrow = c(1, 2))
+plot(dc_gam_1)
+```
+
+GAMM with random intercept for each subject, by day_care attendance
+
+```{r}
+dc_gam_2 <- gam(log_q_per_ml ~ day_care + s(time, by = day_care) + 
+                  s(id, bs = "re"),
+                data = df_red)
+summary(dc_gam_2)
+par(mfrow = c(1, 3))
+plot(dc_gam_2)
+```
+
+In the above plot, the far right describes the distribution of random intercepts
+
+Plotting the summed effects without random effects:
+
+```{r}
+par(mfrow = c(1, 2))
+# summed effects without random effects
+# intercept + s(time):day_careYes
+plot_smooth(dc_gam_2, view = "time", cond = list(day_care = "No"),
+            rm.ranef = TRUE, main = "Intercept + s(time):day_careNo",
+            rug = FALSE,
+            ylab = "Log(q/mL)")
+plot_smooth(dc_gam_2, view = "time", cond = list(day_care = "Yes"),
+            rm.ranef = TRUE, main = "Intercept + s(time):day_careYes",
+            rug = FALSE,
+            ylab = "Log(q/mL)")
+```
+
+Subject specific plots (random effects)
+
+```{r}
+no <- as.vector(with(df_red[df_red$day_care == "No",], unique(id)))
+yes <- as.vector(with(df_red[df_red$day_care == "Yes", ], unique(id)))
+
+plotSubjects <- function(df, day_care, fac, main) {
+  df <- df; day_care <- day_care; fac <- fac
+  myCols <- brewer.pal(9, "Set1")
+  
+  plot_smooth(df, view = "time", 
+              cond = list(day_care = day_care, id = fac[1]),
+              main = main,
+              col = myCols[1], se = FALSE,
+              ylim = c(0, 8), rug = FALSE, ylab = "Log(q/mL)",
+              print.summary = FALSE)
+  
+  for(i in 2:length(fac)) {
+    plot_smooth(df, 
+                view = "time", 
+                cond = list(day_care = day_care, id = fac[i]),
+                add = TRUE, 
+                col = myCols[i], 
+                se = FALSE,
+                rug = FALSE,
+                print.summary = FALSE)
+  }
+}
+
+plotter <- function(df) {
+  par(mfrow = c(1, 2))
+  plotSubjects(df = df, day_care = "No", fac = no,
+              main = "No Day-Care Attendance")
+  plotSubjects(df = df, day_care = "Yes", fac = yes,
+               main = "Attended Day Care")
+}
+
+plotter(df = dc_gam_2)
+```
+
+In the above model we only had about 42.3% of the deviance explained. We may be able to increase this by assuming a random slope component for each individual. Later I will incorporate more predictors/features which may similarly enhance our model fit.
+
+```{r}
+dc_gam_3 <- gam(log_q_per_ml ~ day_care + s(time, by = day_care) +
+                  s(id, time, bs = "re"),
+                data = df_red)
+summary(dc_gam_3)
+par(mfrow = c(1, 3))
+plot(dc_gam_3)
+```
+
+Ah, now the adj-$R^2$ and deviance explained has gone down.
+
+```{r}
+plotter(df = dc_gam_3)
+```
+
+Random intercepts seem to make the most sense. Now to assess the fit once incorporating random intercepts and random slopes.
+
+```{r}
+dc_gam_4 <- gam(log_q_per_ml ~ day_care + s(time, by = day_care) +
+                  s(id, bs = "re") + s(id, time, bs = "re"),
+                data = df_red)
+summary(dc_gam_4)
+par(mfrow = c(2, 2))
+plot(dc_gam_4)
+```
+
+The deviance went back up but did not increase beyond $42.3%$ explained.
+
+```{r}
+plotter(df = dc_gam_4)
+```
+
+The random slope effect is not highly significant.
+
+One more thing to try is random smooths. Upon examining the original data it is tempting to assume a mixture of viral trajectories. The following model can estimate these smooths.
+
+```{r}
+dc_gam_5 <- gam(log_q_per_ml ~ day_care + s(time, by = day_care) +
+                  s(time, id, bs = "fs", m = 1),
+                data = df_red)
+summary(dc_gam_5)
+par(mfrow = c(1, 3))
+plot(dc_gam_5, select = 1)
+plot(dc_gam_5, select = 2)
+plot(dc_gam_5, select = 3)
+abline(h = 0)
+```
+
+Deviance explained increases to 45.2%. The above far right plot is a plot of the distribution of random intercepts.
+
+```{r}
+plotter(df = dc_gam_5)
+```
+
+Since this is a time-series analysis we should examine the autocorrelation effect between observations. Unfortunately, the model does not know that a series a observation is being produced by the same participant in any particular trial. As a result, the estimates for the fixed effects may become less confident. However, the residuals of the model improve: the autocorrelation is reduced and can be seen here:
+
+```{r}
+par(mfrow = c(1, 3))
+acf_resid(dc_gam_1, main = "GAM")
+acf_resid(dc_gam_3, split_pred = "id", main = "GAMM - random slope")
+acf_resid(dc_gam_5, split_pred = "id", main = "GAMM - random smooth")
+```
+
+Full Model
+
+```{r}
+full_gam_1 <- gam(log_q_per_ml ~ day_care + female + siblings + bf_duration +
+                    s(time, by = day_care) +
+                    s(time, by = female) +
+                    s(time, by = siblings) +
+                    s(time, id, bs = "fs", m = 1),
+                  data = df_red)
+
+summary(full_gam_1)
+
+par(mfrow = c(3, 3))
+plot(full_gam_1);
+
+plotter(full_gam_1)
+```
+
+The residuals don't look great, I don't believe the problem comes down to autocorrelation in residuals but I will adjust for this by including an AR1 autocorrelation into the model. We need two things, first the start of each individual event and then the 'rho' parameter which will be the lags of our predicted model time.
+
+```{r}
+# I like this function, I wonder which is faster...
+# library(microbenchmark)
+# test <- df_red %>% arrange(id, time)
+# microbenchmark(
+#   itsadug::start_event(test, column = "time", event = "id"),
+# 
+#   test %>%
+#     group_by(id) %>%
+#     mutate(start.event = row_number() == 1),
+# 
+#   plyr::ddply(test, "id", 
+#               transform,
+#               start.event = seq(length(id)) == 1)
+# )
+# The itsadug::start_event function is slower and ddply is much slower,
+# I will stick with dplyr 
+
+df_first <- df_red %>%
+  group_by(id) %>%
+  mutate(start.event = row_number() == 1)
+
+Rho <- acf(resid(full_gam_1), plot = FALSE)$acf[2]
+
+full_gam_ar1 <- update(full_gam_1,
+                       AR.start = df_first$start.event,
+                       rho = Rho)
+summary(full_gam_ar1)
+par(mfrow = c(3, 3))
+plot(full_gam_1)
+```
+
+This only helped to show that the AR1 correlation structure is non-significant and we don't have autocorrelated residual issues. 
+
+Difference smooths on day_care to test differences in trends. First need to change to treatment encoding. Without this sort of encoding we will not see differences in trends between groups, as evidenced above in the plot(full_gam_1)
+
+```{r}
+df_red$order_dc <- as.ordered(df_red$day_care)
+contrasts(df_red$order_dc) <- 'contr.treatment'
+contrasts(df_red$order_dc)
+
+full_gam_2 <- gam(log_q_per_ml ~ order_dc + female + siblings + bf_duration +
+                    s(time, by = order_dc) +
+                    s(time, by = female) +
+                    s(time, by = siblings) +
+                    s(id, bs = "re") +
+                    s(time, id, bs = "fs", m = 1),
+                  data = df_red)
+
+summary(full_gam_2)
+
+par(mfrow = c(3, 3))
+plot(full_gam_2)
+```
+
+This encoding does not differ much, it just tests that there is a difference in trend between children that attend day care and those that do not. Further, females seem to have a significantly different trend compared to males and having siblings differs as well.
+
