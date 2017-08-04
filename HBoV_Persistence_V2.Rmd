@@ -52,9 +52,7 @@ library(lubridate)    # time and date functions
 library(padr)         # pad time series with missing values
 library(grid)         # grid.arrange
 library(gridExtra)    # grid.arrange extras
-library(xts)          # time-series objects and functions
 library(Rmisc)        # convenience functions for analysis
-library(visreg)       # visualize regressions
 library(ggthemes)     # theme_tufte, theme_bw, etc.
 library(gridExtra)    # arrange ggplot grobs
 library(RColorBrewer) # plotting colors
@@ -62,8 +60,6 @@ library(lattice)      # versatile plotting functions
 library(magrittr)     # extra pipelines/infix operators (%<>%)
 library(reshape2)     # melt and cast data, i.e. wide to long, long to wide
 library(tidyverse)    # everything, including ggplot, dplyr, etc.
-library(caret)        # model building and testing
-library(pander)       # pretty tables and things
 library(knitr)        # kable() tables
 library(kableExtra)   # kable options
 ```
@@ -71,7 +67,8 @@ library(kableExtra)   # kable options
 # Load Data
 
 ```{r}
-setwd("S:/MartinEpi/Analysis/Bocavirus Persistence Modeling/Rdata/")
+setwd("~/Documents/Martin Lab/HBov-1/Persistence_modelling/BocavirusSEATTLE/Rdata")
+# setwd("S:/MartinEpi/Analysis/Bocavirus Persistence Modeling/Rdata/")
 dem.clin.dat <- readRDS("dem_clin_dat.rds")
 diaries <- readRDS("diaries.rds")
 diary.pos <- readRDS("diary_pos.rds")
@@ -112,7 +109,7 @@ First I want to define a persistent infection. Should it be anything greater tha
 Further, It would not seem fair to examine those with infections between 2 and 10 weeks vs. 10 to $max(time)$ or any split for that matter.
 
 ```{r}
-infx_grp <- bov.pad %>% 
+infx_grp <- bov.pad %>%
   filter(!(episode %in% c('','blip'))) %>% 
   group_by(id, episode) %>% 
   arrange(id, week) %>% 
@@ -311,6 +308,21 @@ Infants 179, 184, 207, 243, 247, 270, 285, and 317 follow trend 1, while 92, 162
 ```{r, echo = FALSE, eval = TRUE}
 pattern1 <- c('179','184','207','243','247','270','285','317')
 pattern2 <- c('92','162','189','216','233','271')
+```
+
+This may not matter but I wanted to try my hand at comparing infection curves between primary, secondary, and so on. There are many ways to do this but I am going to use a 'joy plot', a visualization technique that has gained popularity recently that looks pretty dang cool. You can find more information [here](http://blog.revolutionanalytics.com/2017/07/joyplots.html) and [here](http://derekogle.com/fishR/2017-07-28-JoyPlot).
+
+```{r}
+library(ggjoy)
+bov.pad %>%
+  filter(bov_infx == 1 & episode != 'blip') %>%
+  arrange(id, week) %>%
+  group_by(id) %>%
+  mutate(time = row_number()) %>%
+  ungroup() %>%
+  select(-id, -week, -primary_cnt, -bov_infx) %>%
+  filter(!is.na(log_q_per_ml))
+
 ```
 
 # References
