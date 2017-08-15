@@ -62,13 +62,14 @@ library(reshape2)     # melt and cast data, i.e. wide to long, long to wide
 library(tidyverse)    # everything, including ggplot, dplyr, etc.
 library(knitr)        # kable() tables
 library(kableExtra)   # kable options
+library(tableone)     # table 1 generation
 ```
 
 # Load Data
 
 ```{r}
-setwd("~/Documents/Martin Lab/HBov-1/Persistence_modelling/BocavirusSEATTLE/Rdata")
-# setwd("S:/MartinEpi/Analysis/Bocavirus Persistence Modeling/Rdata/")
+# setwd("~/Documents/Martin Lab/HBov-1/Persistence_modelling/BocavirusSEATTLE/Rdata")
+setwd("S:/MartinEpi/Analysis/Bocavirus Persistence Modeling/Rdata/")
 dem.clin.dat <- readRDS("dem_clin_dat.rds")
 diaries <- readRDS("diaries.rds")
 diary.pos <- readRDS("diary_pos.rds")
@@ -103,6 +104,8 @@ theme_trueMinimal <- function(base_size = 11, base_family = "") {
 ```
 
 # Explore Data
+
+## Describe shedding durations
 
 First I want to define a persistent infection. Should it be anything greater than 4 weeks? 6 weeks? 10 weeks? I am going to first explore the data visually to get a better sense of the distributions. 
 
@@ -149,13 +152,31 @@ end <- infx_dates %>%
 colnames(end)[-1] <- paste(colnames(end)[-1], "_end", sep = "")
 
 # merge into one data.frame of durations
-durations <- join_all(list(infx_dur, start, end), 
+durations <- join_all(list(infx_dur, start, end),
                       by = "id", type = "full") %>%
+  mutate(
+    interval_ps = as.numeric(difftime(secondary_start, 
+                             primary_end, 
+                             units = "weeks")),
+    interval_st = as.numeric(difftime(tertiary_start, 
+                             secondary_end, 
+                             units = "weeks")),
+    interval_tq = as.numeric(difftime(quaternary_start, 
+                             tertiary_end, 
+                             units = "weeks")),
+    interval_qq = as.numeric(difftime(quinary_start, 
+                             quaternary_end,
+                             units = "weeks"))
+  ) %>%
   # rearranging for 'tidyness'
-  select(id, starts_with("primary"), 
+  select(id, starts_with("primary"),
+             interval_ps,
              starts_with("secondary"),
+             interval_st,
              starts_with("tertiary"),
+             interval_tq,
              starts_with("quaternary"),
+             interval_qq,
              starts_with("quinary"))
 ```
 
@@ -182,7 +203,7 @@ knitr::kable(summary_table)
 ```{r}
 my_cols <- RColorBrewer::brewer.pal(9, "Set1")
 
-durations %>% 
+durplot <- durations %>% 
   select(ends_with("dur")) %>% 
   melt() %>% 
   filter(!is.na(value)) %>% 
@@ -203,24 +224,161 @@ durations %>%
                    outlier.alpha = 0.5)) %>% 
   add(geom_jitter(color = my_cols[5], alpha = 0.5, size = 3)) %>% 
   add(theme_trueMinimal()) %>%
-  add(labs(x = "Infection Episode",
-           y = "Infection Duration, weeks"))
+  add(labs(x = "\n Infection Episode",
+           y = "Infection Duration, weeks \n"))
+durplot
 ```
 
 There were `r summary_table[1, 1]` primary infections of the 86 children tested for HBoV-1 by RT-PCR. Primary infections have a mean of `r round(as.numeric(summary_table[2, 1]), 2)` weeks of persistent shedding (95% CI: `r round(as.numeric(t.test(durations$primary_dur)$conf.int[1]), 2)`, `r round(as.numeric(t.test(durations$primary_dur)$conf.int[2]), 2)`), with a median of `r summary_table[4, 1]` weeks and maximum of `r summary_table[6, 1]`.
 
 Subsequent shedding episodes generally decrease in duration, with increasing mean durations occurring later in the child's life history (quaternary episode) possibly due to recurrence or end of dormancy. Through genetic testing, our group has come to the conclusion that these multiple periods of infection are likely from the same infecting strain, giving some weight to the idea of an end of latency giving rise to a peak in late shedding.
 
+This may not matter but I wanted to try my hand at comparing infection curves between primary, secondary, and so on. There are many ways to do this but I am going to use a 'joy plot', a visualization technique that has gained popularity recently that looks pretty dang cool. You can find more information [here](http://blog.revolutionanalytics.com/2017/07/joyplots.html) and [here](http://derekogle.com/fishR/2017-07-28-JoyPlot).
+
+```{r, fig.width = 10, fig.height = 5}
+library(ggjoy)
+# re-level episode factor
+levels <- c("primary","secondary","tertiary","quaternary","quinary","blip","")
+bov.pad$episode <- factor(bov.pad$episode, levels = levels)
+
+episodes <- bov.pad %>%
+    filter(episode %in% c('primary','secondary','tertiary','quaternary')) %>%
+    arrange(id, week) %>%
+    group_by(id) %>%
+    mutate(time = row_number()) %>%
+    ungroup() %>%
+    select(-id, -week, -primary_cnt, -bov_infx) %>%
+    filter(!is.na(log_q_per_ml)) %>%
+    arrange(time)
+
+episodes %>%
+    ggplot(aes(x = log_q_per_ml, y = episode, fill = episode)) %>%
+    add(geom_joy(scale = 2)) %>%
+    add(theme_joy(grid = FALSE)) %>%
+    add(scale_fill_manual(values = my_cols)) %>%
+    add(theme(legend.position = "none")) %>%
+    add(labs(x = expression(Log[10] ~ HBoV-1/mL), y = ""))
+```
+
+Distribution of $Log_{10} HBoV-1 / mL$ is skewed for primary, secondary and tertiary. May be a good idea to assume a more robust distribution, like 'Student's t' when modelling $Log_{10}$ $q/mL$ as the response (GAMM modelling)
+
+```{r}
+episodes %>%
+  group_by(episode) %>%
+  summarise(mean = mean(log_q_per_ml),
+            sd = sd(log_q_per_ml),
+            median = median(log_q_per_ml),
+            min = min(log_q_per_ml),
+            max = max(log_q_per_ml),
+            IQR = IQR(log_q_per_ml)) %>%
+  kable(caption = "HBoV-1 viral loads by episode")
+```
+
+The lower limit of detection appears to be at the most 2.4 $Log_{10}$ $q/mL$.
+
+A time-series view
+```{r, fig.width = 10, fig.height = 5}
+episodes %>%
+  ddply(.(episode, time), summarise,
+        log_q_per_ml = mean(log_q_per_ml)) %>%
+  ddply("episode", transform,
+        ma_pcr = zoo::rollmean(log_q_per_ml, 3, 
+                               align = "right", 
+                               na.pad = TRUE)) %>%
+  ggplot(aes(x = time, y = ma_pcr, color = episode)) %>%
+  add(geom_line(size = 1)) %>%
+  add(facet_wrap(~episode, nrow = 1)) %>%
+  add(theme_trueMinimal()) %>%
+  add(scale_color_manual(values = my_cols)) %>%
+  add(theme(legend.position = "none")) %>%
+  add(labs(y = expression(Log[10] ~ HBoV-1/mL),
+           x = "Time, weeks",
+           caption = "Data plotted with 3 week moving averages"))
+```
+
+Plotting each shedding episode aggregating over each individual and averaging over 3 weeks reveals a generally decreasing trend in viral load with some resurgence later in the episode. Primary and secondary events decay rapidly while tertiary and quaternary linger for several weeks. Only 11 individuals contributed to the quaternary period so we may not be able to draw any grand conclusions.
+
+```{r, fig.width = 10, fig.height = 5}
+bov.pad %>%
+  filter(episode %in% c('primary','secondary','tertiary','quaternary')) %>%
+  arrange(id, week) %>%
+  group_by(id) %>%
+  mutate(time = row_number()) %>%
+  ungroup() %>%
+  select(-week, -primary_cnt, -bov_infx) %>%
+  filter(!is.na(log_q_per_ml)) %>%
+  arrange(id, time) %>%
+  ggplot(aes(x = time, y = log_q_per_ml, group = id)) %>%
+  add(geom_line(color = my_cols[2])) %>%
+  add(facet_wrap(~episode)) %>%
+  add(theme_minimal()) %>%
+  add(theme(legend.position = "none")) %>%
+  add(labs(
+    x = "\n Duration, weeks",
+    y = expression(Log[10] ~ HBoV-1/mL)
+  ))
+```
+
+## Latency Periods/Time between shedding events
+
+```{r}
+intervals <- durations %>%
+  select(starts_with("interval")) %>%
+  filter(!is.na(interval_ps))
+```
+
+```{r}
+intervals %>%
+  select(-interval_qq) %>%
+  melt() %>%
+  mutate(interval = revalue(variable,
+                            c("interval_ps" = "Primary-Secondary",
+                              "interval_st" = "Secondary-Tertiary",
+                              "interval_tq" = "Tertiary-Quaternary"))) %>%
+  select(-variable) %>%
+  filter(!is.na(value)) %>%
+  ggplot(aes(x = value, y = interval)) %>%
+  add(geom_joy(aes(fill = interval))) %>%
+  add(theme_trueMinimal()) %>%
+  add(theme(legend.position = "none")) %>%
+  add(scale_fill_manual(values = my_cols)) %>%
+  add(labs(
+    x = "\n Time, weeks",
+    y = "Interval between shedding events"
+  ))
+```
+
+```{r}
+f <- function(x) {
+  n = length(na.omit(x))
+  mean = mean(x, na.rm = TRUE)
+  sd = sd(x, na.rm = TRUE)
+  median = median(x, na.rm = TRUE)
+  min = min(x, na.rm = TRUE)
+  max = max(x, na.rm = TRUE)
+  return(data.frame(n = n,
+                    mean = mean,
+                    sd = sd,
+                    median = median,
+                    min = min,
+                    max = max))
+}
+
+kable(sapply(intervals, f))
+```
+
+## Primary Infections
+
+### Defining persistence
+
 ```{r}
 quantile(durations$primary_dur, seq(0, 1, by = 0.1))
 ```
 
-70% of the infections are less than 6 weeks in duration. We could consider infections of 10 weeks or more as being persistent infections (20% of the data).
-
-## Persistent Infections
+70% of the infections are less than 6 weeks in duration. We could consider infections of 10 weeks or more as being persistent infections (80th percentile and above).
 
 ```{r}
-persistent <- durations %>% 
+persistent <- durations %>%
   filter(primary_dur >= 10) %>%
   select(id, primary_dur)
 
@@ -236,6 +394,8 @@ persistent %>%
 
 Defining persistent shedding events as > 10 weeks results in 14 individuals with a mean duration of 17 weeks (95 % CI: `r round(as.numeric(t.test(persistent$primary_dur)$conf.int[1]), 2)`, `r round(as.numeric(t.test(persistent$primary_dur)$conf.int[2]), 2)`)
 
+To get a better view of the individual shedding experience I will plot each experience and fit a smoothed line.
+
 ```{r}
 primary_persist <- persistent %>%
   select(id) %>%
@@ -246,44 +406,7 @@ primary_persist <- persistent %>%
   group_by(id) %>%
   mutate(time = row_number()) %>%
   ungroup()
-  
-grp <- unique(primary_persist$id)[1:7]
-ppA <- primary_persist %>% filter(id %in% grp)
-ppB <- primary_persist %>% filter(!(id %in% grp))
-
-grpPlot <- function(df) {
-  p <- df %>%
-  filter(!is.na(log_q_per_ml)) %>%
-  ggplot(aes(x = time)) %>%
-  add(geom_line(aes(y = log_q_per_ml, color = id),
-                size = 1.05)) %>%
-  add(geom_hline(yintercept = 3.0, linetype = 2)) %>%
-  add(theme_bw()) %>%
-  add(scale_x_continuous(breaks = seq(0, 30, by = 5),
-                         limits = c(0, 30))) %>%
-  add(scale_y_continuous(breaks = seq(2, 10, by = 2),
-                         limits = c(2, 10))) %>%
-  add(theme(legend.position = c(0.9, 0.8))) %>%
-  add(labs(title = '',
-           x = '',
-           y = '',
-           color = "Infant ID"))
-  p
-}
-
-grpAplot <- grpPlot(ppA)
-grpBplot <- grpPlot(ppB)
 ```
-
-```{r, fig.cap = "--- indicates lower limit of detection = 3.0", fig.width = 10, fig.height = 7}
-grid.arrange(grpAplot, grpBplot, ncol = 2,
-             bottom = grid::textGrob("Weeks from Infection Start"),
-             left = grid::textGrob(expression(Log[10] ~ HBoV-1/mL), rot = 90))
-```
-
-By splitting into groups of 7 the shapes of the infectivity curves are a little clearer, though not by much. At a cursory glance, some shedding patterns tend to start low, increase to a peak, then decay exponentially with some resurgence at the end. On the other hand, some start high and immediately begin to decay exponentially, either one could be true. Also, it is possible that, for the latter case, the study team missed the first positive in the series. We will refer to the first pattern (start low, peak, decay) as pattern 1, and the second one as pattern 2 (start high, decay).
-
-To get a better view of the individual shedding experience I will plot each experience and fit a smoothed line.
 
 ```{r, fig.width = 12, fig.height = 7}
 primary_persist %>%
@@ -310,19 +433,234 @@ pattern1 <- c('179','184','207','243','247','270','285','317')
 pattern2 <- c('92','162','189','216','233','271')
 ```
 
-This may not matter but I wanted to try my hand at comparing infection curves between primary, secondary, and so on. There are many ways to do this but I am going to use a 'joy plot', a visualization technique that has gained popularity recently that looks pretty dang cool. You can find more information [here](http://blog.revolutionanalytics.com/2017/07/joyplots.html) and [here](http://derekogle.com/fishR/2017-07-28-JoyPlot).
+### Population Demographics by Persistence
 
 ```{r}
-library(ggjoy)
-bov.pad %>%
-  filter(bov_infx == 1 & episode != 'blip') %>%
-  arrange(id, week) %>%
-  group_by(id) %>%
-  mutate(time = row_number()) %>%
-  ungroup() %>%
-  select(-id, -week, -primary_cnt, -bov_infx) %>%
-  filter(!is.na(log_q_per_ml))
+subset_demo <- main.long %>%
+  distinct(id, maternal.dob, infant.dob, race_text,
+           total.number.of.family, number.of.family..18.yrs,
+           family.income, daycare.start, daycare.start.c,
+           daycare.end, daycare.end.c, play.group, play.start,
+           play.start.c, play.end, play.end.c, day.week.play,
+           bf_duration, siblings, breast_fed, seizure_hx, female) %>%
+  mutate(daycare_dur = difftime(daycare.end, daycare.start, units = "weeks"),
+         daycare_dur = as.numeric(daycare_dur),
+         day_care = ifelse(daycare.start.c == 1, 1, 0),
+         play_group = ifelse(play.group == 'Y', 1, 0),
+         play_group = ifelse(play.group == 'unknown', NA, play_group),
+         playgrp_dur = difftime(play.end, play.start, units = "weeks"),
+         playgrp_dur = as.numeric(playgrp_dur),
+         persistent = ifelse(id %in% persistent$id, 1, 0)) %>%
+  mutate_at(c("siblings","breast_fed","seizure_hx",
+              "female","day_care","play_group","persistent"),
+            funs(factor(., levels = c(0, 1),
+                        labels = c("No", "Yes")))) %>%
+  rename(fam_lt_18 = number.of.family..18.yrs,
+         family_income = family.income,
+         family_size = total.number.of.family)
 
+dput(names(subset_demo))
+
+vars <- c("female", "siblings", "race_text", "family_size", "fam_lt_18",
+          "breast_fed", "bf_duration", "seizure_hx", 
+          "daycare_dur", "day_care", "play_group","playgrp_dur")
+
+nonnormal <- c("family_size", "fam_lt_18","bf_duration", 
+               "daycare_dur", "playgrp_dur")
+
+table1 <- CreateTableOne(vars = vars,
+                         data = subset_demo,
+                         strata = "persistent")
+print(table1, nonnormal = nonnormal)
+```
+
+### Infectivity Curve
+
+```{r}
+ppA <- primary_persist %>% filter(id %in% pattern1)
+ppB <- primary_persist %>% filter(id %in% pattern2)
+
+grpPlot <- function(df, smooth = FALSE, ylab, xlab) {
+  p <- df %>%
+    filter(!is.na(log_q_per_ml)) %>%
+    ggplot(aes(x = time)) %>%
+    add(geom_line(aes(y = log_q_per_ml, color = id),
+                  size = 1.05)) %>%
+    add(theme_bw()) %>%
+    add(scale_x_continuous(breaks = seq(0, 30, by = 5),
+                           limits = c(0, 30))) %>%
+    add(scale_y_continuous(breaks = seq(2, 10, by = 2),
+                           limits = c(2, 10))) %>%
+    add(theme(legend.justification = c("right", "top"),
+              legend.position = c(0.98, 0.98))) %>%
+    add(labs(title = '',
+             y = ylab,
+             x = xlab,
+             color = "Infant ID"))
+  
+  if (smooth) {
+    p <- p + geom_smooth(aes(y = log_q_per_ml),
+                         method = "gam",
+                         formula = y ~ s(x, bs = "ps"),
+                         color = "black",
+                         se = FALSE,
+                         size = 1.5)
+  }
+  p
+}
+
+grpAplot <- grpPlot(ppA, ylab = expression(Log[10] ~ HBoV-1/mL), xlab = '')
+grpBplot <- grpPlot(ppB, ylab = '', xlab = '')
+grpAplot.smooth <- grpPlot(ppA, smooth = TRUE, xlab = '', 
+                           ylab = expression(Log[10] ~ HBoV-1/mL))
+grpBplot.smooth <- grpPlot(ppB, smooth = TRUE, xlab = '', ylab = '')
+```
+
+```{r, fig.width = 10, fig.height = 7}
+library(ggpubr)
+plot1 <- ggarrange(grpAplot, grpBplot, ncol = 2, labels = c("A","B"))
+annotate_figure(plot1,
+                bottom = text_grob("Weeks from Infection Start"))
+```
+
+By splitting into groups of 7 the shapes of the infectivity curves are a little clearer, though not by much. At a cursory glance, some shedding patterns tend to start low, increase to a peak, then decay exponentially with some resurgence at the end. On the other hand, some start high and immediately begin to decay exponentially, either one could be true. Also, it is possible that, for the latter case, the study team missed the first positive in the series. We will refer to the first pattern (start low, peak, decay) as pattern 1, and the second one as pattern 2 (start high, decay).
+
+We can see these patterns more easily with a smooth approximation through an additive model. Pattern 1 is well depicted below in figure A while pattern 2 can be seen in figure B. These smooths are perhaps not the best due to the 'wiggliness' seen in less dense parts; they could be penalized more. 
+
+```{r, fig.cap = "Smooths fitted with P-splines through GAM framework", fig.width = 10, fig.height = 7}
+plot2 <- ggarrange(grpAplot.smooth, grpBplot.smooth,
+                   ncol = 2, labels = c("A", "C"))
+plot2
+```
+
+```{r}
+pointsPat1 <- primary_persist %>%
+  filter(id %in% pattern1) %>%
+  group_by(id) %>%
+  arrange(id, week) %>%
+  mutate(first = row_number() == 1,
+         last = row_number() == n(),
+         peak = ifelse(max(log_q_per_ml, na.rm = TRUE) == log_q_per_ml, 
+                       TRUE, FALSE),
+         point = factor(ifelse(first, 'first',
+                               ifelse(peak, 'peak',
+                                      ifelse(last, 'last', ''))))) %>%
+  ungroup() %>%
+  filter(point != '') %>%
+  select(-week, -first, -last, -peak)
+
+pat1plot <- persistent %>%
+  filter(id %in% pattern1) %>%
+  ggplot() %>%
+  add(geom_segment(aes(x = 1, xend = primary_dur, y = id, yend = id),
+                   size = 3,
+                   color = my_cols[5])) %>%
+  add(geom_point(data = pointsPat1,
+                 aes(x = time, y = id,
+                     size = log_q_per_ml),
+                 color = my_cols[2],
+                 shape = 21)) %>%
+  add(geom_point(data = pointsPat1,
+                 aes(x = time, y = id),
+                 color = my_cols[2],
+                 size = 4)) %>%
+  add(scale_size_continuous(range = c(3, 12))) %>%
+  add(scale_x_continuous(limits = c(0, 30),
+                         breaks = seq(0, 30, by = 5))) %>%
+  add(theme_bw()) %>%
+  add(theme(legend.position = "none")) %>%
+  add(labs(x = "", y = "ID"))
+
+pointsPat2 <- primary_persist %>%
+  filter(id %in% pattern2) %>%
+  group_by(id) %>%
+  arrange(id, week) %>%
+  mutate(first = row_number() == 1,
+         last = row_number() == n(),
+         point = factor(ifelse(first, 'first',
+                               ifelse(last, 'last', '')))) %>%
+  ungroup() %>%
+  filter(point != '') %>%
+  select(-week, -first, -last)
+
+pat2plot <- persistent %>%
+  filter(id %in% pattern2) %>%
+  ggplot() %>%
+  add(geom_segment(aes(x = 1, xend = primary_dur, y = id, yend = id),
+                   size = 3,
+                   color = my_cols[5])) %>%
+  add(geom_point(data = pointsPat2,
+                 aes(x = time, y = id,
+                     size = log_q_per_ml),
+                 color = my_cols[2],
+                 shape = 21)) %>%
+  add(geom_point(data = pointsPat2,
+                 aes(x = time, y = id),
+                 color = my_cols[2],
+                 size = 4)) %>%
+  add(scale_size_continuous(range = c(3, 12))) %>%
+  add(scale_x_continuous(limits = c(0, 30),
+                         breaks = seq(0, 30, by = 5))) %>%
+  add(theme_bw()) %>%
+  add(theme(legend.position = c(0.85, 0.3))) %>%
+  add(labs(x = "", y = "",
+           size = (expression(Log[10] ~ HBoV-1/mL))))
+```
+
+```{r, fig.width = 13, fig.height = 8}
+plot3 <- ggarrange(pat1plot, pat2plot, ncol = 2, labels = c("B","D"))
+annotate_figure(plot3,
+                bottom = text_grob("Duration of Primary Infection, weeks"))
+```
+
+It is difficult to draw conclusion from this plot. A) Those with the longest duration tend to have peaks occurring later (subjects 285, 270, and 247, compared to 207, 184, and 179). This is confounded by subject 243 with a peak occurring at the same time as 247. Differences in age at time of primary infection may be able to account for these differences but these vary wildly across subjects. 
+
+At a glance, age at the time of primary infection cannot account for differences in patterns, nor durations. Subject 285, with a duration of around 28 weeks, contracted this virus at 39 weeks, compare that with subject 233 of whom contracted the virus at 37 weeks and lasted only 10 weeks. Age at primary infection may still be able to explain the propensity of persistent, long lasting infection compared with those whose infection die out relatively quickly (the other 52 subjects in this study).
+
+```{r}
+big_plot <- ggarrange(plot2, plot3, nrow = 2)
+annotate_figure(big_plot,
+                bottom = textGrob("Duration of Primary Infection, Weeks"))
+
+# library(Cairo)
+# Cairo("S:/MartinEpi/Analysis/Bocavirus Persistence Modeling/plots and figures/primary_infections.png",
+#       type = "png",
+#       units = "in",
+#       width = 12,
+#       height = 13,
+#       pointsize = 12,
+#       dpi = 96)
+# big_plot <- ggarrange(plot2, plot3, nrow = 2)
+# annotate_figure(big_plot,
+#                 bottom = textGrob("Duration of Primary Infection, Weeks"))
+# dev.off()
+```
+
+```{r}
+pointsPat1$pattern <- "Pattern 1"
+pointsPat2$pattern <- "Pattern 2"
+viral_loads <- rbind(pointsPat1, pointsPat2)
+
+primary_vloads <- viral_loads %>%
+  mutate(period = as.character(point),
+         period = factor(period,
+                         levels = c("first","peak","last")),
+         pattern = factor(pattern)) %>%
+  select(-point, -time) %>%
+  ggplot(aes(x = period, y = log_q_per_ml)) %>%
+  add(geom_boxplot(outlier.shape = NA)) %>%
+  add(geom_jitter(aes(color = id), 
+                  alpha = 0.7,
+                  size = 5,
+                  width = 0.25)) %>% 
+  add(facet_wrap(~pattern, scales = "free_x")) %>%
+  add(theme_bw()) %>%
+  add(theme(legend.position = "none")) %>%
+  add(labs(
+    x = "Primary Infection Period",
+    y = expression(Log[10] ~ HBoV-1/mL)
+  ))
+primary_vloads
 ```
 
 # References
