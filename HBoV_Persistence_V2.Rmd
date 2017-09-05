@@ -25,6 +25,11 @@ opts_chunk$set(echo = TRUE,
 opts_knit$set(width = 85)
 ```
 
+```{r, eval = FALSE, echo = FALSE}
+setwd("S:/MartinEpi/Analysis/Bocavirus Persistence Modeling")
+cat(readr::read_file("boca_library.bib"), sep = "\n")
+```
+
 # Introduction
 
 Human bocavirus (HBoV-1), a DNA virus first identified in 2005 [@allander_cloning_2005], has been frequently detected in young children experiencing acute respiratory tract illness. HBoV-1 has been detected in up to 18% of samples from children with respiratory illness [@jartti_human_2012]. Over 85% of children in the United States have antibodies to this virus by 4 years of age [@kahn_seroepidemiology_2008], yet HBoV-1 is rarely detected in adults [@jartti_human_2012]. Furthermore, HBoV-1 is often detected in children without evidence of disease and is often identified alongside with other respiratory viruses associated with acute illness [@jartti_human_2012, @martin_clinical_2008, @fry_human_2007, @allander_human_2007, @christensen_human_2010]. Thus, retrospective or cross-sectional analyses designed to make an inference on disease progression, incidence and persistence are problematic. The purpose of this analysis is in identifying trends regarding persistence and latency of human bocavirus 1 in a pediatric cohort.
@@ -255,15 +260,18 @@ episodes %>%
     ggplot(aes(x = log_q_per_ml, y = episode, fill = episode)) %>%
     add(geom_joy(scale = 2)) %>%
     add(theme_joy(grid = FALSE)) %>%
-    add(scale_fill_manual(values = my_cols)) %>%
+    add(scale_fill_brewer(direction = -1)) %>%
     add(theme(legend.position = "none")) %>%
-    add(labs(x = expression(Log[10] ~ HBoV-1/mL), y = ""))
+    add(labs(
+      x = expression(Log[10] ~ HBoV-1 ~ " DNA Concentration"), 
+      y = ""
+      ))
 ```
 
 Distribution of $Log_{10} HBoV-1 / mL$ is skewed for primary, secondary and tertiary. May be a good idea to assume a more robust distribution, like 'Student's t' when modelling $Log_{10}$ $q/mL$ as the response (GAMM modelling)
 
 ```{r}
-episodes %>%
+viral_load_tab <- episodes %>%
   group_by(episode) %>%
   summarise(mean = mean(log_q_per_ml),
             sd = sd(log_q_per_ml),
@@ -272,34 +280,16 @@ episodes %>%
             max = max(log_q_per_ml),
             IQR = IQR(log_q_per_ml)) %>%
   kable(caption = "HBoV-1 viral loads by episode")
+
+viral_load_tab
 ```
 
 The lower limit of detection appears to be at the most 2.4 $Log_{10}$ $q/mL$.
 
-A time-series view
-```{r, fig.width = 10, fig.height = 5}
-episodes %>%
-  ddply(.(episode, time), summarise,
-        log_q_per_ml = mean(log_q_per_ml)) %>%
-  ddply("episode", transform,
-        ma_pcr = zoo::rollmean(log_q_per_ml, 3, 
-                               align = "right", 
-                               na.pad = TRUE)) %>%
-  ggplot(aes(x = time, y = ma_pcr, color = episode)) %>%
-  add(geom_line(size = 1)) %>%
-  add(facet_wrap(~episode, nrow = 1)) %>%
-  add(theme_trueMinimal()) %>%
-  add(scale_color_manual(values = my_cols)) %>%
-  add(theme(legend.position = "none")) %>%
-  add(labs(y = expression(Log[10] ~ HBoV-1/mL),
-           x = "Time, weeks",
-           caption = "Data plotted with 3 week moving averages"))
-```
-
 Plotting each shedding episode aggregating over each individual and averaging over 3 weeks reveals a generally decreasing trend in viral load with some resurgence later in the episode. Primary and secondary events decay rapidly while tertiary and quaternary linger for several weeks. Only 11 individuals contributed to the quaternary period so we may not be able to draw any grand conclusions.
 
 ```{r, fig.width = 10, fig.height = 5}
-bov.pad %>%
+episode_ts <- bov.pad %>%
   filter(episode %in% c('primary','secondary','tertiary','quaternary')) %>%
   arrange(id, week) %>%
   group_by(id) %>%
@@ -308,63 +298,22 @@ bov.pad %>%
   select(-week, -primary_cnt, -bov_infx) %>%
   filter(!is.na(log_q_per_ml)) %>%
   arrange(id, time) %>%
-  ggplot(aes(x = time, y = log_q_per_ml, group = id)) %>%
-  add(geom_line(color = my_cols[2])) %>%
-  add(facet_wrap(~episode)) %>%
+  ggplot(aes(x = time, y = log_q_per_ml)) %>%
+  add(geom_point(color = my_cols[2])) %>%
+  add(geom_smooth(aes(x = time, y = log_q_per_ml),
+                  se = FALSE,
+                  color = my_cols[5],
+                  span = 0.4)) %>%
+  add(facet_wrap(~episode, nrow = 4)) %>%
   add(theme_minimal()) %>%
   add(theme(legend.position = "none")) %>%
   add(labs(
+    title = "Shedding Event Viral Load Time-Series",
     x = "\n Duration, weeks",
-    y = expression(Log[10] ~ HBoV-1/mL)
+    y = expression(Log[10] ~ HBoV-1 ~ " DNA Concentration")
   ))
-```
 
-## Latency Periods/Time between shedding events
-
-```{r}
-intervals <- durations %>%
-  select(starts_with("interval")) %>%
-  filter(!is.na(interval_ps))
-```
-
-```{r}
-intervals %>%
-  select(-interval_qq) %>%
-  melt() %>%
-  mutate(interval = revalue(variable,
-                            c("interval_ps" = "Primary-Secondary",
-                              "interval_st" = "Secondary-Tertiary",
-                              "interval_tq" = "Tertiary-Quaternary"))) %>%
-  select(-variable) %>%
-  filter(!is.na(value)) %>%
-  ggplot(aes(x = value, y = interval)) %>%
-  add(geom_joy(aes(fill = interval))) %>%
-  add(theme_trueMinimal()) %>%
-  add(theme(legend.position = "none")) %>%
-  add(scale_fill_manual(values = my_cols)) %>%
-  add(labs(
-    x = "\n Time, weeks",
-    y = "Interval between shedding events"
-  ))
-```
-
-```{r}
-f <- function(x) {
-  n = length(na.omit(x))
-  mean = mean(x, na.rm = TRUE)
-  sd = sd(x, na.rm = TRUE)
-  median = median(x, na.rm = TRUE)
-  min = min(x, na.rm = TRUE)
-  max = max(x, na.rm = TRUE)
-  return(data.frame(n = n,
-                    mean = mean,
-                    sd = sd,
-                    median = median,
-                    min = min,
-                    max = max))
-}
-
-kable(sapply(intervals, f))
+episode_ts
 ```
 
 ## Primary Infections
@@ -422,7 +371,7 @@ primary_persist %>%
   add(scale_x_continuous(breaks = seq(0, 30, by = 5),
                          limits = c(0, 30))) %>%
   add(labs(x = "\n Weeks from Infection Start",
-           y = expression(Log[10] ~ HBoV-1/mL),
+           y = expression(Log[10] ~ HBoV-1 ~ " DNA Concentration"),
            caption = "Limited to infections spanning \u2265 10 weeks"))
 ```
 
@@ -459,7 +408,7 @@ subset_demo <- main.long %>%
          family_income = family.income,
          family_size = total.number.of.family)
 
-dput(names(subset_demo))
+# dput(names(subset_demo))
 
 vars <- c("female", "siblings", "race_text", "family_size", "fam_lt_18",
           "breast_fed", "bf_duration", "seizure_hx", 
@@ -512,7 +461,7 @@ grpPlot <- function(df, smooth = FALSE, ylab, xlab) {
 grpAplot <- grpPlot(ppA, ylab = expression(Log[10] ~ HBoV-1/mL), xlab = '')
 grpBplot <- grpPlot(ppB, ylab = '', xlab = '')
 grpAplot.smooth <- grpPlot(ppA, smooth = TRUE, xlab = '', 
-                           ylab = expression(Log[10] ~ HBoV-1/mL))
+                           ylab = expression(Log[10] ~ HBoV-1 ~ " DNA Concentration"))
 grpBplot.smooth <- grpPlot(ppB, smooth = TRUE, xlab = '', ylab = '')
 ```
 
@@ -529,7 +478,7 @@ We can see these patterns more easily with a smooth approximation through an add
 
 ```{r, fig.cap = "Smooths fitted with P-splines through GAM framework", fig.width = 10, fig.height = 7}
 plot2 <- ggarrange(grpAplot.smooth, grpBplot.smooth,
-                   ncol = 2, labels = c("A", "C"))
+                   ncol = 2, labels = c("1a", "2a"))
 plot2
 ```
 
@@ -608,7 +557,7 @@ pat2plot <- persistent %>%
 ```
 
 ```{r, fig.width = 13, fig.height = 8}
-plot3 <- ggarrange(pat1plot, pat2plot, ncol = 2, labels = c("B","D"))
+plot3 <- ggarrange(pat1plot, pat2plot, ncol = 2, labels = c("1b","2b"))
 annotate_figure(plot3,
                 bottom = text_grob("Duration of Primary Infection, weeks"))
 ```
@@ -617,7 +566,7 @@ It is difficult to draw conclusion from this plot. A) Those with the longest dur
 
 At a glance, age at the time of primary infection cannot account for differences in patterns, nor durations. Subject 285, with a duration of around 28 weeks, contracted this virus at 39 weeks, compare that with subject 233 of whom contracted the virus at 37 weeks and lasted only 10 weeks. Age at primary infection may still be able to explain the propensity of persistent, long lasting infection compared with those whose infection die out relatively quickly (the other 52 subjects in this study).
 
-```{r}
+```{r, fig.width = 13, fig.height = 8}
 big_plot <- ggarrange(plot2, plot3, nrow = 2)
 annotate_figure(big_plot,
                 bottom = textGrob("Duration of Primary Infection, Weeks"))
@@ -636,7 +585,7 @@ annotate_figure(big_plot,
 # dev.off()
 ```
 
-```{r}
+```{r, fig.width = 8, fig.height = 6}
 pointsPat1$pattern <- "Pattern 1"
 pointsPat2$pattern <- "Pattern 2"
 viral_loads <- rbind(pointsPat1, pointsPat2)
@@ -658,9 +607,239 @@ primary_vloads <- viral_loads %>%
   add(theme(legend.position = "none")) %>%
   add(labs(
     x = "Primary Infection Period",
-    y = expression(Log[10] ~ HBoV-1/mL)
+    y = expression(Log[10] ~ HBoV-1 ~ " DNA Concentration")
   ))
 primary_vloads
+```
+
+## Chronic Infections/Latency
+
+```{r, fig.width = 10, fig.height = 6}
+set.seed(123)
+some_folks <- sample(subset_demo$id, 8, replace = FALSE)
+
+episodes_long <- bov.pad %>%
+  filter((id %in% some_folks) & !is.na(log_q_per_ml)) %>%
+  group_by(id) %>%
+  mutate(time = row_number()) %>%
+  ungroup() %>%
+  select(-week, -primary_cnt, -bov_infx)
+
+episodes_long %>%
+  ggplot(aes(x = time, y = log_q_per_ml, color = episode)) %>%
+  add(geom_point()) %>%
+  add(geom_line(data = filter(episodes_long, episode != 'blip'))) %>%
+  add(facet_wrap(~id, ncol = 4, scales = "free_x")) %>%
+  add(theme_bw()) %>%
+  add(theme(legend.position = "bottom")) %>%
+  add(labs(
+    x = 'Time since birth, weeks',
+    y = expression(Log[10] ~ HBoV-1 ~ " DNA Concentration")
+  ))
+```
+
+## Latency Periods/Time between shedding events
+
+```{r}
+intervals <- durations %>%
+  select(starts_with("interval")) %>%
+  filter(!is.na(interval_ps))
+```
+
+```{r}
+f <- function(x) {
+  n = length(na.omit(x))
+  mean = mean(x, na.rm = TRUE)
+  sd = sd(x, na.rm = TRUE)
+  median = median(x, na.rm = TRUE)
+  min = min(x, na.rm = TRUE)
+  max = max(x, na.rm = TRUE)
+  return(data.frame(n = n,
+                    mean = mean,
+                    sd = sd,
+                    median = median,
+                    min = min,
+                    max = max))
+}
+
+kable(sapply(intervals, f))
+```
+
+Let's find the average time since birth for each episode.
+
+```{r}
+demo_plus_dur <- subset_demo %>%
+  full_join(durations, by = "id") %>%
+  mutate(
+    time_to_primary = difftime(primary_start, infant.dob, units = "weeks"),
+    time_to_secondary = difftime(secondary_start, infant.dob, units = "weeks"),
+    time_to_tertiary = difftime(tertiary_start, infant.dob, units = "weeks"),
+    time_to_quaternary = difftime(quaternary_start, infant.dob, units = "weeks"),
+    time_to_quinary = difftime(quinary_start, infant.dob, units = "weeks")
+  )
+```
+
+```{r}
+demo_plus_dur %>%
+  select(starts_with("time")) %>%
+  sapply(f) %>%
+  t() %>%
+  kable()
+```
+
+```{r}
+primary <- c("primary_dur", "interval_ps", "time_to_primary")
+secondary <- c("secondary_dur", "interval_st", "time_to_secondary")
+tertiary <- c("tertiary_dur", "interval_tq", "time_to_tertiary")
+quaternary <- c("quaternary_dur", "time_to_quaternary")
+
+p <- demo_plus_dur %>%
+  select(primary_dur, secondary_dur, tertiary_dur, quaternary_dur,
+         starts_with("interval"), 
+         starts_with("time_to"),
+         -interval_qq, -time_to_quinary) %>%
+  melt() %>%
+  filter(!is.na(value)) %>%
+  mutate(
+    event = ifelse(variable %in% primary, 'Primary', ''),
+    event = ifelse(variable %in% secondary, 'Secondary', event),
+    event = ifelse(variable %in% tertiary, 'Tertiary', event),
+    event = ifelse(variable %in% quaternary, 'Quaternary', event),
+    event = factor(event, levels = c("Primary", 
+                                     "Secondary",
+                                     "Tertiary", 
+                                     "Quaternary")),
+    
+    series = ifelse(grepl("dur", variable), "Shedding", ""),
+    series = ifelse(grepl("interval", variable), "Latent period", series),
+    series = ifelse(grepl("time_to", variable), "Time since birth", series),
+    series = factor(series, levels = c("Shedding", 
+                                       "Latent period", 
+                                       "Time since birth")),
+    
+    variable = factor(variable, labels = c("Primary", 
+                                           "Secondary", 
+                                           "Tertiary", 
+                                           "Quaternary",
+                                           "Primary-Secondary", 
+                                           "Secondary-Tertiary",
+                                           "Tertiary-Quaternary",
+                                           "Time to Primary",
+                                           "Time to Secondary",
+                                           "Time to Tertiary",
+                                           "Time to Quaternary"))
+  ) %>%
+  ggplot(aes(x = value, y = variable)) %>%
+  add(geom_joy(aes(fill = event))) %>%
+  add(facet_wrap(~series, nrow = 3, scales = "free")) %>%
+  add(theme_minimal()) %>%
+  add(theme(legend.position = "bottom")) %>%
+  add(scale_fill_brewer(direction = -1)) %>%
+  add(labs(
+    title = "HBoV-1 Shedding Event Time Distributions",
+    x = "Time, weeks",
+    y = "",
+    fill = "Shedding Event"
+  ))
+```
+
+```{r, eval = FALSE, echo = FALSE}
+# library(Cairo)
+# setwd("S:/MartinEpi/Analysis/Bocavirus Persistence Modeling/plots and figures/")
+# Cairo("distribution_of_time_series.png",
+#       type = "png",
+#       units = "in",
+#       width = 10,
+#       height = 12,
+#       pointsize = 14,
+#       dpi = 96)
+# p
+# dev.off()
+```
+
+```{r, fig.width = 12, fig.height = 14}
+cowplot::plot_grid(p, episode_ts, labels = c("A", "B"), ncol = 2)
+
+# library(Cairo)
+# setwd("S:/MartinEpi/Analysis/Bocavirus Persistence Modeling/plots and figures/")
+# Cairo("shedding_event_panel.png",
+#       type = "png",
+#       units = "in",
+#       width = 12,
+#       height = 14,
+#       pointsize = 16,
+#       dpi = 96)
+# cowplot::plot_grid(p, episode_ts, labels = c("A", "B"), ncol = 2)
+# dev.off()
+```
+
+# Modelling
+
+## Time-to-Event/Duration of positivity
+
+```{r}
+library(survival)
+library(survMisc)
+library(survminer)
+library(GGally)
+
+lev_lab <- c("primary", "secondary", "tertiary", "quaternary")
+durations_long <- durations %>%
+  select(ends_with("dur"), -quinary_dur) %>%
+  melt() %>%
+  filter(!is.na(value)) %>%
+  rename(event = variable, duration = value) %>%
+  mutate(
+    event = gsub("_dur", "", event),
+    event = factor(event, 
+                   levels = lev_lab,
+                   labels = lev_lab),
+    status = 1
+  )
+
+surv_obj <- Surv(durations_long$duration, durations_long$status)
+surv_fit <- survfit(surv_obj ~ durations_long$event)
+surv_tab <- summary(surv_fit)$table[, 4:9]
+row.names(surv_tab) <- lev_lab
+colnames(surv_tab) <- c("Events", "Restricted Mean", "Restricted SE",
+                        "Median", "95% CI LB", "95% CI UB")
+
+# plot(surv_fit, col = my_cols[1:4], lty = c(1:4), lwd = 2)
+# legend(22, 0.95, c("Primary", "Secondary", "Tertiary", "Quaternary"),
+#        lty = c(1:4), col = my_cols[1:4], border = NA)
+
+surv_plot <- ggsurv(surv_fit, 
+                    plot.cens = FALSE, 
+                    lty.est = c(1:4),
+                    size.est = 1.5,
+                    surv.col = my_cols[1:4],
+                    order.legend = FALSE) +
+  theme_minimal() +
+  guides(color = FALSE, linetype = FALSE) +
+  annotate(
+    "text",
+    label = lev_lab,
+    x = c(9, 20, 3, 28),
+    y = c(0.3, 0.0, 0.1, 0.125),
+    size = 5,
+    color = my_cols[1:4]
+  )
+
+table <- surv_tab %>%
+  data.frame() %>%
+  mutate(
+    Restricted.Mean = round(Restricted.Mean, 2),
+    Restricted.SE = round(Restricted.SE, 2)) %>%
+  setNames(nm = colnames(surv_tab)) %>%
+  `rownames<-`(lev_lab) %>%
+  tableGrob(theme = ttheme_minimal(
+    rowhead = list(fg_params = list(col = my_cols[1:4])),
+    colhead = list(fg_params = list(fontface = c(rep("plain", 7), "")))
+    ))
+
+grid.arrange(surv_plot, table, nrow = 2,
+             as.table = TRUE, 
+             heights = c(4, 1))
 ```
 
 # References
